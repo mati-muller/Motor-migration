@@ -14,6 +14,10 @@ pub struct PostgresConnection {
 
 impl PostgresConnection {
     pub async fn connect(config: &super::ConnectionConfig) -> Result<Self> {
+        // Primero intentar crear la base de datos si no existe
+        Self::ensure_database_exists(config).await?;
+
+        // Conectar a la base de datos destino
         let conn_string = format!(
             "host={} port={} dbname={} user={} password={}",
             config.postgres_host,
@@ -37,6 +41,50 @@ impl PostgresConnection {
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
         })
+    }
+
+    /// Verifica si la base de datos existe y la crea si no
+    async fn ensure_database_exists(config: &super::ConnectionConfig) -> Result<()> {
+        // Conectar a la base de datos 'postgres' (siempre existe)
+        let admin_conn_string = format!(
+            "host={} port={} dbname=postgres user={} password={}",
+            config.postgres_host,
+            config.postgres_port,
+            config.postgres_user,
+            config.postgres_password
+        );
+
+        let (client, connection) = tokio_postgres::connect(&admin_conn_string, NoTls)
+            .await
+            .context("Error conectando a PostgreSQL (admin)")?;
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::error!("Error en conexión admin PostgreSQL: {}", e);
+            }
+        });
+
+        // Verificar si la base de datos existe
+        let db_name = &config.postgres_database;
+        let check_query = "SELECT 1 FROM pg_database WHERE datname = $1";
+        let rows = client.query(check_query, &[db_name]).await?;
+
+        if rows.is_empty() {
+            // La base de datos no existe, crearla
+            // Nota: CREATE DATABASE no acepta parámetros, hay que usar formato directo
+            // pero escapamos el nombre para seguridad
+            let safe_db_name = db_name.replace('"', "\"\"");
+            let create_query = format!("CREATE DATABASE \"{}\"", safe_db_name);
+
+            client.execute(&create_query, &[]).await
+                .context(format!("Error creando base de datos '{}'", db_name))?;
+
+            tracing::info!("Base de datos '{}' creada exitosamente", db_name);
+        } else {
+            tracing::info!("Base de datos '{}' ya existe", db_name);
+        }
+
+        Ok(())
     }
 
     /// Crea una tabla en PostgreSQL
