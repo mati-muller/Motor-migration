@@ -80,7 +80,8 @@ impl PostgresConnection {
         Ok(())
     }
 
-    /// Inserta filas en una tabla usando texto plano (más robusto)
+    /// Inserción optimizada por lotes con fallback a filas individuales
+    /// Usa sub-batches para evitar límites de tamaño SQL
     pub async fn insert_rows(
         &self,
         schema: &str,
@@ -89,7 +90,6 @@ impl PostgresConnection {
         rows: Vec<Vec<DynamicValue>>,
     ) -> Result<InsertResult> {
         if rows.is_empty() {
-            tracing::warn!("insert_rows: No hay filas para insertar en {}.{}", schema, table);
             return Ok(InsertResult::default());
         }
 
@@ -98,108 +98,67 @@ impl PostgresConnection {
             return Ok(InsertResult::default());
         }
 
-        tracing::info!("insert_rows: Insertando {} filas en {}.{} con {} columnas",
-            rows.len(), schema, table, columns.len());
-
         let client = self.client.lock().await;
 
         let col_names: Vec<String> = columns.iter()
             .map(|c| format!("\"{}\"", c.name))
             .collect();
+        let col_names_str = col_names.join(", ");
 
         let mut result = InsertResult::default();
 
-        // Insertar fila por fila para mejor manejo de errores
-        for (row_idx, row) in rows.iter().enumerate() {
-            let mut values: Vec<String> = Vec::new();
+        // Tamaño de sub-batch (100 filas por INSERT para balance entre velocidad y tamaño SQL)
+        const SUB_BATCH_SIZE: usize = 100;
 
-            for (i, val) in row.iter().enumerate() {
-                let col = &columns[i];
-                let sql_value = val.to_sql_string(col.should_convert_to_json);
-                values.push(sql_value);
+        // Procesar en sub-batches
+        for chunk in rows.chunks(SUB_BATCH_SIZE) {
+            // Construir INSERT con múltiples VALUES
+            let mut all_values: Vec<String> = Vec::with_capacity(chunk.len());
+
+            for row in chunk {
+                let row_values: Vec<String> = row.iter()
+                    .enumerate()
+                    .map(|(i, val)| val.to_sql_string(columns[i].should_convert_to_json))
+                    .collect();
+                all_values.push(format!("({})", row_values.join(",")));
             }
 
             let insert_sql = format!(
-                "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({})",
-                schema,
-                table,
-                col_names.join(", "),
-                values.join(", ")
+                "INSERT INTO \"{}\".\"{}\" ({}) VALUES {}",
+                schema, table, col_names_str, all_values.join(",")
             );
 
-            // Log primera fila para debugging
-            if row_idx == 0 {
-                tracing::debug!("SQL de primera fila: {}", &insert_sql[..insert_sql.len().min(500)]);
-            }
-
+            // Intentar batch insert
             match client.execute(&insert_sql, &[]).await {
-                Ok(_) => result.inserted += 1,
-                Err(e) => {
-                    let err_msg = format!("Error insertando en {}.{}: {}", schema, table, e);
-                    tracing::warn!("{}", err_msg);
-                    if result.errors.len() < 10 {
-                        result.errors.push(err_msg);
-                    }
-                    result.failed += 1;
+                Ok(count) => {
+                    result.inserted += count;
                 }
-            }
-        }
+                Err(batch_err) => {
+                    // Si falla el batch, intentar fila por fila para identificar el problema
+                    tracing::warn!("Batch insert falló, intentando fila por fila: {}", batch_err);
 
-        Ok(result)
-    }
+                    for row in chunk {
+                        let row_values: Vec<String> = row.iter()
+                            .enumerate()
+                            .map(|(i, val)| val.to_sql_string(columns[i].should_convert_to_json))
+                            .collect();
 
-    /// Inserción por lotes más eficiente
-    pub async fn insert_batch(
-        &self,
-        schema: &str,
-        table: &str,
-        columns: &[ColumnInfo],
-        rows: Vec<Vec<DynamicValue>>,
-    ) -> Result<InsertResult> {
-        if rows.is_empty() {
-            return Ok(InsertResult::default());
-        }
+                        let single_sql = format!(
+                            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({})",
+                            schema, table, col_names_str, row_values.join(",")
+                        );
 
-        let client = self.client.lock().await;
-
-        let col_names: Vec<String> = columns.iter()
-            .map(|c| format!("\"{}\"", c.name))
-            .collect();
-
-        let mut result = InsertResult::default();
-
-        // Construir INSERT con múltiples VALUES
-        let mut all_values: Vec<String> = Vec::new();
-
-        for row in &rows {
-            let mut row_values: Vec<String> = Vec::new();
-
-            for (i, val) in row.iter().enumerate() {
-                let col = &columns[i];
-                let sql_value = val.to_sql_string(col.should_convert_to_json);
-                row_values.push(sql_value);
-            }
-
-            all_values.push(format!("({})", row_values.join(", ")));
-        }
-
-        let insert_sql = format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES {}",
-            schema,
-            table,
-            col_names.join(", "),
-            all_values.join(", ")
-        );
-
-        match client.execute(&insert_sql, &[]).await {
-            Ok(count) => {
-                result.inserted = count;
-            }
-            Err(e) => {
-                let err_msg = format!("Error en batch insert: {}", e);
-                tracing::warn!("{}", err_msg);
-                result.errors.push(err_msg);
-                result.failed = rows.len() as u64;
+                        match client.execute(&single_sql, &[]).await {
+                            Ok(_) => result.inserted += 1,
+                            Err(e) => {
+                                if result.errors.len() < 5 {
+                                    result.errors.push(format!("{}", e));
+                                }
+                                result.failed += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
 

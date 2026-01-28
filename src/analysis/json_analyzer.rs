@@ -48,7 +48,7 @@ impl Default for JsonAnalyzer {
     fn default() -> Self {
         Self {
             sample_size: 100,
-            recommendation_threshold: 60,
+            recommendation_threshold: 60, // Umbral para convertir a JSONB
         }
     }
 }
@@ -62,25 +62,48 @@ impl JsonAnalyzer {
     }
 
     /// Analiza una columna y determina si debería convertirse a JSON
+    /// Los NULLs se ignoran - solo se analizan datos válidos
     pub fn analyze_column(&self, column: &ColumnInfo, samples: &[Option<String>]) -> JsonAnalysisResult {
         let mut score: u8 = 0;
         let mut reasons = Vec::new();
 
-        // 1. Evaluar tipo de dato original (30 puntos máx)
+        // Contar NULLs (se ignoran en el análisis, no restan puntos)
+        let null_count = samples.iter()
+            .filter(|s| s.is_none() || s.as_ref().map(|v| v.is_empty()).unwrap_or(true))
+            .count() as u32;
+        let total = samples.len() as u32;
+        let non_null_count = total.saturating_sub(null_count);
+
+        // Si no hay datos válidos, no hay nada que analizar
+        if non_null_count == 0 {
+            return JsonAnalysisResult {
+                column_name: column.name.clone(),
+                should_convert: false,
+                score: 0,
+                reason: "Sin datos válidos para analizar".to_string(),
+                sample_valid_json: 0,
+                sample_invalid_json: 0,
+                sample_null: null_count,
+                sample_total: total,
+            };
+        }
+
+        // 1. Evaluar tipo de dato original (40 puntos máx)
         let type_score = self.evaluate_data_type(column);
         score = score.saturating_add(type_score);
         if type_score > 0 {
             reasons.push(format!("Tipo {} favorable (+{})", column.data_type, type_score));
         }
 
-        // 2. Evaluar estructura del contenido (40 puntos máx)
-        let (content_score, valid_json, invalid_json, null_count) = self.evaluate_content(samples);
+        // 2. Evaluar contenido - SOLO datos no-NULL (50 puntos máx)
+        let (content_score, valid_json, invalid_json, _) = self.evaluate_content(samples);
         score = score.saturating_add(content_score);
         if content_score > 0 {
             reasons.push(format!("Contenido estructurado (+{})", content_score));
         }
 
-        // 3. Evaluar consistencia (20 puntos máx)
+        // 3. Consistencia basada SOLO en datos válidos (no-NULL) - 20 puntos máx
+        // Los NULLs no cuentan para el ratio
         let total_non_null = valid_json + invalid_json;
         let consistency_score = if total_non_null > 0 {
             let ratio = valid_json as f32 / total_non_null as f32;
@@ -98,11 +121,19 @@ impl JsonAnalyzer {
         };
         score = score.saturating_add(consistency_score);
 
-        // 4. Beneficio de migración (10 puntos máx)
-        let benefit_score = self.evaluate_migration_benefit(column, valid_json, samples.len() as u32);
+        // 4. Beneficio de migración (20 puntos máx) - solo datos válidos
+        let benefit_score = self.evaluate_migration_benefit(column, valid_json, non_null_count);
         score = score.saturating_add(benefit_score);
         if benefit_score > 0 {
             reasons.push(format!("Beneficio JSONB (+{})", benefit_score));
+        }
+
+        // Agregar info de NULLs si hay muchos (solo informativo, no resta)
+        if null_count > 0 && total > 0 {
+            let null_pct = (null_count as f32 / total as f32 * 100.0) as u8;
+            if null_pct > 50 {
+                reasons.push(format!("{}% NULL (ignorados)", null_pct));
+            }
         }
 
         let should_convert = score >= self.recommendation_threshold;
@@ -120,25 +151,28 @@ impl JsonAnalyzer {
             sample_valid_json: valid_json,
             sample_invalid_json: invalid_json,
             sample_null: null_count,
-            sample_total: samples.len() as u32,
+            sample_total: total,
         }
     }
 
-    /// Evalúa el tipo de dato original (máx 30 puntos)
+    /// Evalúa el tipo de dato original (máx 40 puntos)
+    /// MUY agresivo para convertir a JSONB
     fn evaluate_data_type(&self, column: &ColumnInfo) -> u8 {
         let data_type = column.data_type.to_lowercase();
         let max_len = column.max_length.unwrap_or(0);
 
         match data_type.as_str() {
-            "xml" => 25,
-            "nvarchar" | "varchar" if max_len == -1 || max_len > 1000 => 20,
-            "ntext" | "text" => 15,
-            "nvarchar" | "varchar" if max_len > 255 => 10,
+            "xml" => 40,                                                    // XML siempre a JSON
+            "nvarchar" | "varchar" if max_len == -1 || max_len > 500 => 35, // Texto largo MAX
+            "ntext" | "text" => 35,                                         // Text types
+            "nvarchar" | "varchar" if max_len > 200 => 30,                  // Texto largo
+            "nvarchar" | "varchar" if max_len > 50 => 20,                   // Texto mediano
             _ => 0,
         }
     }
 
-    /// Evalúa el contenido de las muestras (máx 40 puntos)
+    /// Evalúa el contenido de las muestras (máx 50 puntos)
+    /// MUY agresivo para detectar JSON
     fn evaluate_content(&self, samples: &[Option<String>]) -> (u8, u32, u32, u32) {
         let mut valid_json = 0u32;
         let mut invalid_json = 0u32;
@@ -152,19 +186,20 @@ impl JsonAnalyzer {
                 Some(s) => {
                     let trimmed = s.trim();
 
-                    // Verificar si parece JSON (incluye formatos con comillas externas)
-                    // Casos: {}, [], "{...}", "[...]"
+                    // Verificar si parece JSON o estructura de datos
                     if trimmed.starts_with('{') || trimmed.starts_with('[') ||
                        trimmed.starts_with("\"{") || trimmed.starts_with("\"[") ||
-                       trimmed.starts_with("'{") || trimmed.starts_with("'[") {
+                       trimmed.starts_with("'{") || trimmed.starts_with("'[") ||
+                       trimmed.contains("\":") || trimmed.contains("\": ") ||
+                       trimmed.contains("\\\"") {  // También detectar escapes
                         looks_like_json += 1;
                     }
 
-                    // Intentar parsear como JSON (varios formatos)
+                    // Intentar parsear como JSON
                     if try_parse_json(trimmed).is_some() {
                         valid_json += 1;
                     } else if trimmed.starts_with('<') {
-                        // Para XML, contamos como potencial JSON
+                        // XML cuenta como candidato a JSON
                         looks_like_json += 1;
                         invalid_json += 1;
                     } else {
@@ -177,51 +212,54 @@ impl JsonAnalyzer {
         let total_non_null = valid_json + invalid_json;
         let mut score: u8 = 0;
 
-        // Puntos por estructura JSON detectada
+        // Puntos por JSON válido detectado (MUY generoso)
         if total_non_null > 0 {
             let json_ratio = valid_json as f32 / total_non_null as f32;
-            if json_ratio > 0.8 {
-                score = score.saturating_add(25); // JSON válido mayoritario
-            } else if json_ratio > 0.5 {
-                score = score.saturating_add(15);
+            if json_ratio > 0.3 {
+                score = score.saturating_add(40); // 30% o más es JSON = máximo
+            } else if json_ratio > 0.1 {
+                score = score.saturating_add(30); // Al menos 10% es JSON
+            } else if valid_json > 0 {
+                score = score.saturating_add(20); // Cualquier JSON detectado
             }
         }
 
-        // Puntos por patrones que parecen JSON
+        // Puntos por patrones que parecen JSON (más generoso)
         if total_non_null > 0 {
             let looks_ratio = looks_like_json as f32 / total_non_null as f32;
-            if looks_ratio > 0.7 {
-                score = score.saturating_add(15);
-            } else if looks_ratio > 0.3 {
-                score = score.saturating_add(8);
+            if looks_ratio > 0.2 {
+                score = score.saturating_add(10);
             }
         }
 
-        (score.min(40), valid_json, invalid_json, null_count)
+        (score.min(50), valid_json, invalid_json, null_count)
     }
 
-    /// Evalúa el beneficio de migrar a JSONB (máx 10 puntos)
+    /// Evalúa el beneficio de migrar a JSONB (máx 20 puntos)
     fn evaluate_migration_benefit(&self, column: &ColumnInfo, valid_json: u32, total: u32) -> u8 {
         if total == 0 {
             return 0;
         }
 
         let valid_ratio = valid_json as f32 / total as f32;
+        let max_len = column.max_length.unwrap_or(0);
 
         // JSONB en PostgreSQL permite indexación y búsqueda eficiente
-        // Solo vale la pena si hay datos estructurados reales
-        if valid_ratio > 0.7 && column.max_length.unwrap_or(0) > 100 {
+        // Muy generoso para convertir a JSONB
+        if valid_ratio > 0.3 && max_len > 50 {
+            20
+        } else if valid_ratio > 0.1 || max_len > 200 {
+            15
+        } else if valid_json > 0 {
             10
-        } else if valid_ratio > 0.5 {
-            5
         } else {
             0
         }
     }
 
     /// Convierte un valor a JSON de forma segura
-    /// Retorna None si no se puede convertir (se insertará NULL)
-    /// Soporta formatos: {...}, [...], "{...}", "[...]", '{...}', '[...]'
+    /// SIEMPRE retorna un valor JSON - nunca pierde datos
+    /// Si no puede parsear como JSON estructurado, lo guarda como JSON string
     pub fn safe_convert_to_json(value: &Option<String>) -> Option<JsonValue> {
         match value {
             None => None,
@@ -229,19 +267,46 @@ impl JsonAnalyzer {
             Some(s) => {
                 let trimmed = s.trim();
 
-                // Intentar parsear JSON en varios formatos
+                // 1. Intentar parsear JSON en varios formatos
                 if let Some(json) = try_parse_json(trimmed) {
                     return Some(json);
                 }
 
-                // Intentar convertir XML a JSON (simplificado)
+                // 2. Intentar convertir XML a JSON
                 if trimmed.starts_with('<') {
                     if let Some(json) = xml_to_json_simple(trimmed) {
                         return Some(json);
                     }
                 }
 
-                // No se pudo convertir, retornar NULL
+                // 3. Si no se pudo parsear, guardar como JSON string (no perder datos)
+                Some(JsonValue::String(s.clone()))
+            }
+        }
+    }
+
+    /// Convierte un valor a JSON, retorna None solo si es NULL/vacío
+    /// Para casos donde preferimos NULL en lugar de string
+    pub fn convert_to_json_or_null(value: &Option<String>) -> Option<JsonValue> {
+        match value {
+            None => None,
+            Some(s) if s.is_empty() => None,
+            Some(s) => {
+                let trimmed = s.trim();
+
+                // Intentar parsear JSON
+                if let Some(json) = try_parse_json(trimmed) {
+                    return Some(json);
+                }
+
+                // XML a JSON
+                if trimmed.starts_with('<') {
+                    if let Some(json) = xml_to_json_simple(trimmed) {
+                        return Some(json);
+                    }
+                }
+
+                // No se pudo convertir
                 None
             }
         }
@@ -276,20 +341,19 @@ impl JsonAnalyzer {
 }
 
 /// Intenta parsear JSON en varios formatos comunes
-/// Soporta: {...}, [...], "{...}", "[...]", '{...}', '[...]'
+/// Soporta múltiples formatos de escape y comillas
 fn try_parse_json(s: &str) -> Option<JsonValue> {
+    let trimmed = s.trim();
+
     // 1. Intento directo (formato normal: {...} o [...])
-    if let Ok(json) = serde_json::from_str::<JsonValue>(s) {
+    if let Ok(json) = serde_json::from_str::<JsonValue>(trimmed) {
         return Some(json);
     }
 
     // 2. JSON con comillas dobles externas: "{...}" o "[...]"
-    // Esto ocurre cuando SQL Server almacena JSON como string escapado
-    if (s.starts_with("\"{") && s.ends_with("}\"")) ||
-       (s.starts_with("\"[") && s.ends_with("]\"")) {
-        // Remover comillas externas y desescapar
-        let inner = &s[1..s.len()-1];
-        // Desescapar las comillas internas \" -> "
+    if (trimmed.starts_with("\"{") && trimmed.ends_with("}\"")) ||
+       (trimmed.starts_with("\"[") && trimmed.ends_with("]\"")) {
+        let inner = &trimmed[1..trimmed.len()-1];
         let unescaped = inner.replace("\\\"", "\"").replace("\\\\", "\\");
         if let Ok(json) = serde_json::from_str::<JsonValue>(&unescaped) {
             return Some(json);
@@ -297,21 +361,60 @@ fn try_parse_json(s: &str) -> Option<JsonValue> {
     }
 
     // 3. JSON con comillas simples externas: '{...}' o '[...]'
-    if (s.starts_with("'{") && s.ends_with("}'")) ||
-       (s.starts_with("'[") && s.ends_with("]'")) {
-        let inner = &s[1..s.len()-1];
+    if (trimmed.starts_with("'{") && trimmed.ends_with("}'")) ||
+       (trimmed.starts_with("'[") && trimmed.ends_with("]'")) {
+        let inner = &trimmed[1..trimmed.len()-1];
         if let Ok(json) = serde_json::from_str::<JsonValue>(inner) {
             return Some(json);
         }
     }
 
-    // 4. Intentar parsear como string JSON (cuando viene como "\"...\"")
-    // Esto es JSON doblemente escapado
-    if s.starts_with('"') && s.ends_with('"') {
-        if let Ok(JsonValue::String(inner_str)) = serde_json::from_str::<JsonValue>(s) {
-            // El contenido interno podría ser JSON
+    // 4. JSON doblemente escapado como string
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        if let Ok(JsonValue::String(inner_str)) = serde_json::from_str::<JsonValue>(trimmed) {
             if let Ok(json) = serde_json::from_str::<JsonValue>(&inner_str) {
                 return Some(json);
+            }
+        }
+    }
+
+    // 5. Intentar limpiar y parsear - quitar comillas externas simples
+    if (trimmed.starts_with('"') && trimmed.ends_with('"')) ||
+       (trimmed.starts_with('\'') && trimmed.ends_with('\'')) {
+        let inner = &trimmed[1..trimmed.len()-1];
+        if let Ok(json) = serde_json::from_str::<JsonValue>(inner) {
+            return Some(json);
+        }
+        // Intentar desescapar
+        let unescaped = inner
+            .replace("\\\"", "\"")
+            .replace("\\'", "'")
+            .replace("\\\\", "\\");
+        if let Ok(json) = serde_json::from_str::<JsonValue>(&unescaped) {
+            return Some(json);
+        }
+    }
+
+    // 6. Buscar JSON embebido en el string
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                let potential_json = &trimmed[start..=end];
+                if let Ok(json) = serde_json::from_str::<JsonValue>(potential_json) {
+                    return Some(json);
+                }
+            }
+        }
+    }
+
+    // 7. Buscar array JSON embebido
+    if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            if end > start {
+                let potential_json = &trimmed[start..=end];
+                if let Ok(json) = serde_json::from_str::<JsonValue>(potential_json) {
+                    return Some(json);
+                }
             }
         }
     }
@@ -383,16 +486,18 @@ mod tests {
     fn test_non_json_detection() {
         let analyzer = JsonAnalyzer::default();
 
+        // Texto simple que NO es JSON (evitar números que se parsean como JSON válido)
         let samples = vec![
-            Some("Simple text".to_string()),
-            Some("Another text".to_string()),
-            Some("12345".to_string()),
+            Some("Simple text here".to_string()),
+            Some("Another text description".to_string()),
+            Some("More plain text".to_string()),
         ];
 
+        // Usar varchar pequeño (<=50) para que no sume puntos por tipo
         let column = ColumnInfo {
             name: "description".to_string(),
             data_type: "varchar".to_string(),
-            max_length: Some(100),
+            max_length: Some(30),  // Pequeño, no suma puntos
             precision: None,
             scale: None,
             is_nullable: true,
@@ -401,12 +506,12 @@ mod tests {
             should_convert_to_json: false,
             json_score: 0,
             json_reason: String::new(),
-            pg_type: "VARCHAR(100)".to_string(),
+            pg_type: "VARCHAR(30)".to_string(),
         };
 
         let result = analyzer.analyze_column(&column, &samples);
         assert!(!result.should_convert);
-        assert!(result.score < 60);
+        assert!(result.score < 60); // Umbral es 60
     }
 
     #[test]
@@ -415,9 +520,19 @@ mod tests {
         let invalid = Some("not json".to_string());
         let empty = None;
 
-        assert!(JsonAnalyzer::safe_convert_to_json(&valid).is_some());
-        assert!(JsonAnalyzer::safe_convert_to_json(&invalid).is_none());
+        // JSON válido se parsea correctamente
+        let valid_result = JsonAnalyzer::safe_convert_to_json(&valid);
+        assert!(valid_result.is_some());
+        assert!(valid_result.unwrap().is_object());
+
+        // Texto inválido se guarda como JSON string (no se pierde)
+        let invalid_result = JsonAnalyzer::safe_convert_to_json(&invalid);
+        assert!(invalid_result.is_some());
+        assert!(invalid_result.unwrap().is_string());
+
+        // NULL/vacío retorna None
         assert!(JsonAnalyzer::safe_convert_to_json(&empty).is_none());
+        assert!(JsonAnalyzer::safe_convert_to_json(&Some("".to_string())).is_none());
     }
 
     #[test]

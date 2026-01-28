@@ -198,10 +198,11 @@ impl SqlServerConnection {
     }
 
     /// Obtiene una muestra de datos de una columna para análisis JSON
+    /// Solo trae datos NO NULL para análisis más preciso
     pub async fn sample_column_for_json(&self, schema: &str, table: &str, column: &str, sample_size: u32) -> Result<Vec<Option<String>>> {
         let query = format!(
-            "SELECT TOP {} CAST([{}] AS NVARCHAR(MAX)) FROM [{}].[{}]",
-            sample_size, column, schema, table
+            "SELECT TOP {} CAST([{}] AS NVARCHAR(MAX)) FROM [{}].[{}] WHERE [{}] IS NOT NULL AND LEN(CAST([{}] AS NVARCHAR(MAX))) > 0",
+            sample_size, column, schema, table, column, column
         );
 
         let mut client = self.client.lock().await;
@@ -212,8 +213,8 @@ impl SqlServerConnection {
             .iter()
             .map(|row| {
                 match row.get::<&str, _>(0) {
-                    Some(s) => Some(s.to_string()),
-                    None => None,
+                    Some(s) if !s.is_empty() => Some(s.to_string()),
+                    _ => None,
                 }
             })
             .collect();
@@ -225,7 +226,6 @@ impl SqlServerConnection {
     /// Retorna los datos como strings para simplicidad
     pub async fn read_rows(&self, schema: &str, table: &str, columns: &[String], offset: i64, limit: i64) -> Result<Vec<Vec<Option<String>>>> {
         if columns.is_empty() {
-            tracing::error!("read_rows: No hay columnas para leer de [{}].[{}]", schema, table);
             return Ok(Vec::new());
         }
 
@@ -239,13 +239,9 @@ impl SqlServerConnection {
             columns_str, schema, table, offset, limit
         );
 
-        tracing::debug!("read_rows query: {}", &query[..query.len().min(200)]);
-
         let mut client = self.client.lock().await;
         let stream = client.query(&query, &[]).await?;
         let rows = stream.into_first_result().await?;
-
-        tracing::info!("read_rows: {} filas obtenidas de [{}].[{}] (offset: {})", rows.len(), schema, table, offset);
 
         let result: Vec<Vec<Option<String>>> = rows
             .into_iter()

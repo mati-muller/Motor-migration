@@ -35,9 +35,9 @@ impl Default for MigrationConfig {
         Self {
             parallel_analysis: 8,   // 8 tablas analizando en paralelo
             parallel_migration: 4,  // 4 tablas migrando en paralelo
-            batch_size: 1000,
+            batch_size: 5000,       // 5000 filas por lote (más rápido)
             json_sample_size: 100,
-            json_threshold: 60,
+            json_threshold: 60,     // Umbral para convertir a JSONB
         }
     }
 }
@@ -182,6 +182,19 @@ impl MigrationEngine {
                             &col.name,
                             analyzer.sample_size()
                         ).await {
+                            // Contar cuántos valores no son null
+                            let non_null_count = samples.iter()
+                                .filter(|s| s.as_ref().map(|v| !v.is_empty()).unwrap_or(false))
+                                .count();
+
+                            // Solo analizar si hay datos reales (no todo null)
+                            if non_null_count == 0 {
+                                col.json_reason = "Columna sin datos (todos NULL)".to_string();
+                                col.json_score = 0;
+                                col.should_convert_to_json = false;
+                                continue;
+                            }
+
                             let analysis = analyzer.analyze_column(col, &samples);
                             col.should_convert_to_json = analysis.should_convert;
                             col.json_score = analysis.score;
@@ -266,13 +279,8 @@ impl MigrationEngine {
                 let mut total_migrated = 0i64;
                 let mut json_nulled = 0u32;
 
-                tracing::info!(
-                    "Migrando tabla {} con {} columnas, {} filas esperadas",
-                    table_name, table.columns.len(), table.row_count
-                );
-
                 if table.columns.is_empty() {
-                    tracing::error!("ERROR: La tabla {} no tiene columnas definidas!", table_name);
+                    tracing::error!("La tabla {} no tiene columnas definidas", table_name);
                     return;
                 }
 
@@ -299,20 +307,6 @@ impl MigrationEngine {
                         break;
                     }
 
-                    tracing::info!("Leídas {} filas de {} (offset {})", rows.len(), table_name, offset);
-
-                    // Mostrar primera fila para debugging
-                    if offset == 0 && !rows.is_empty() {
-                        let first_row_preview: Vec<String> = rows[0].iter()
-                            .take(3)
-                            .map(|v| match v {
-                                Some(s) => format!("\"{}\"", s.chars().take(30).collect::<String>()),
-                                None => "NULL".to_string()
-                            })
-                            .collect();
-                        tracing::info!("Preview primera fila de {}: {:?}", table_name, first_row_preview);
-                    }
-
                     // Convertir filas a valores dinámicos
                     let mut converted_rows = Vec::new();
                     for row in &rows {
@@ -326,8 +320,6 @@ impl MigrationEngine {
                     }
 
                     // Insertar en PostgreSQL
-                    tracing::info!("Enviando {} filas convertidas a PostgreSQL para {}", converted_rows.len(), table_name);
-
                     let result = postgres.insert_rows(
                         &table.schema,
                         &table.name,
@@ -337,14 +329,10 @@ impl MigrationEngine {
 
                     match result {
                         Ok(r) => {
-                            tracing::info!("Resultado insert {}: {} insertadas, {} fallidas",
-                                table_name, r.inserted, r.failed);
-                            if !r.errors.is_empty() {
-                                for err in &r.errors {
-                                    tracing::warn!("Error detalle: {}", err);
-                                }
-                            }
                             total_migrated += r.inserted as i64;
+                            if r.failed > 0 {
+                                tracing::warn!("{}: {} insertadas, {} fallidas", table_name, r.inserted, r.failed);
+                            }
                         }
                         Err(e) => {
                             let error_msg = format!("Error insertando: {}", e);
@@ -438,17 +426,14 @@ fn is_text_column(data_type: &str) -> bool {
 }
 
 /// Convierte datos de string a DynamicValue para PostgreSQL
-fn convert_string_data(data: &Option<String>, column: &ColumnInfo, json_nulled: &mut u32) -> DynamicValue {
+fn convert_string_data(data: &Option<String>, column: &ColumnInfo, _json_nulled: &mut u32) -> DynamicValue {
     // Si la columna debe convertirse a JSON
     if column.should_convert_to_json {
+        // safe_convert_to_json SIEMPRE retorna valor para strings no vacíos
+        // Si no puede parsear como JSON estructurado, lo guarda como string JSON
         match JsonAnalyzer::safe_convert_to_json(data) {
             Some(json) => DynamicValue::Json(json),
-            None => {
-                if data.is_some() {
-                    *json_nulled += 1;
-                }
-                DynamicValue::Null
-            }
+            None => DynamicValue::Null, // Solo para NULL o vacío
         }
     } else {
         // Conversión normal basada en el tipo de destino PostgreSQL
