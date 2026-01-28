@@ -201,7 +201,7 @@ impl SqlServerConnection {
     /// Solo trae datos NO NULL para análisis más preciso
     pub async fn sample_column_for_json(&self, schema: &str, table: &str, column: &str, sample_size: u32) -> Result<Vec<Option<String>>> {
         let query = format!(
-            "SELECT TOP {} CAST([{}] AS NVARCHAR(MAX)) FROM [{}].[{}] WHERE [{}] IS NOT NULL AND LEN(CAST([{}] AS NVARCHAR(MAX))) > 0",
+            "SELECT TOP {} CAST([{}] AS NVARCHAR(MAX)) FROM [{}].[{}] WITH (NOLOCK) WHERE [{}] IS NOT NULL AND LEN(CAST([{}] AS NVARCHAR(MAX))) > 0",
             sample_size, column, schema, table, column, column
         );
 
@@ -222,8 +222,8 @@ impl SqlServerConnection {
         Ok(samples)
     }
 
-    /// Lee filas de una tabla con paginación
-    /// Retorna los datos como strings para simplicidad
+    /// Lee filas de una tabla con paginación rápida
+    /// Usa NOLOCK para lecturas sin bloqueo
     pub async fn read_rows(&self, schema: &str, table: &str, columns: &[String], offset: i64, limit: i64) -> Result<Vec<Vec<Option<String>>>> {
         if columns.is_empty() {
             return Ok(Vec::new());
@@ -234,8 +234,9 @@ impl SqlServerConnection {
             .collect::<Vec<_>>()
             .join(", ");
 
+        // Query con NOLOCK para lectura rápida sin bloqueos
         let query = format!(
-            "SELECT {} FROM [{}].[{}] ORDER BY (SELECT NULL) OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+            "SELECT {} FROM [{}].[{}] WITH (NOLOCK) ORDER BY (SELECT NULL) OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
             columns_str, schema, table, offset, limit
         );
 

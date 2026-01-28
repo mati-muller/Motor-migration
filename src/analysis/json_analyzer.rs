@@ -48,7 +48,7 @@ impl Default for JsonAnalyzer {
     fn default() -> Self {
         Self {
             sample_size: 100,
-            recommendation_threshold: 60, // Umbral para convertir a JSONB
+            recommendation_threshold: 73, // Umbral para convertir a JSONB
         }
     }
 }
@@ -511,7 +511,7 @@ mod tests {
 
         let result = analyzer.analyze_column(&column, &samples);
         assert!(!result.should_convert);
-        assert!(result.score < 60); // Umbral es 60
+        assert!(result.score < 73); // Umbral es 73
     }
 
     #[test]

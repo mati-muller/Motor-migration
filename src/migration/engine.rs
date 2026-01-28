@@ -37,7 +37,7 @@ impl Default for MigrationConfig {
             parallel_migration: 4,  // 4 tablas migrando en paralelo
             batch_size: 5000,       // 5000 filas por lote (más rápido)
             json_sample_size: 100,
-            json_threshold: 60,     // Umbral para convertir a JSONB
+            json_threshold: 73,     // Umbral para convertir a JSONB
         }
     }
 }
