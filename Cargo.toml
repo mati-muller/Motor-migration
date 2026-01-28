@@ -1,0 +1,46 @@
+[package]
+name = "sql_migration_engine"
+version = "1.0.0"
+edition = "2021"
+description = "Motor de migración SQL Server a PostgreSQL con GUI"
+
+[dependencies]
+# GUI
+eframe = "0.29"
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["all_loaders"] }
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+bytes = "1.9"
+
+# SQL Server
+tiberius = { version = "0.12", default-features = false, features = ["rustls", "chrono", "bigdecimal"] }
+
+# PostgreSQL
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+postgres-types = { version = "0.2", features = ["derive"] }
+
+# Serialización
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilidades
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Paralelismo
+futures = "0.3"
+
+# Conexión TCP para SQL Server
+async-net = "2.0"
+
+[profile.release]
+opt-level = 3
+lto = true
