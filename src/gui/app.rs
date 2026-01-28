@@ -337,8 +337,8 @@ impl MigrationApp {
             });
 
             ui.horizontal(|ui| {
-                ui.label("Umbral JSON (0-100):");
-                ui.add(egui::Slider::new(&mut self.migration_config.json_threshold, 0..=100));
+                ui.label(format!("Umbral JSON (>= {} para JSONB):", self.migration_config.json_threshold));
+                ui.add(egui::Slider::new(&mut self.migration_config.json_threshold, 0..=100).show_value(true));
             });
         });
 
