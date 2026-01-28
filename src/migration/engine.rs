@@ -45,6 +45,8 @@ impl Default for MigrationConfig {
 /// Evento de progreso para la GUI
 #[derive(Debug, Clone)]
 pub enum MigrationEvent {
+    /// Conexión exitosa, envía lista de tablas
+    ConnectionSuccess(Vec<TableInfo>),
     AnalysisStarted(String),
     AnalysisComplete(String, Vec<ColumnInfo>),
     MigrationStarted(String),
@@ -264,6 +266,16 @@ impl MigrationEngine {
                 let mut total_migrated = 0i64;
                 let mut json_nulled = 0u32;
 
+                tracing::info!(
+                    "Migrando tabla {} con {} columnas, {} filas esperadas",
+                    table_name, table.columns.len(), table.row_count
+                );
+
+                if table.columns.is_empty() {
+                    tracing::error!("ERROR: La tabla {} no tiene columnas definidas!", table_name);
+                    return;
+                }
+
                 loop {
                     let rows = match sqlserver.read_rows(
                         &table.schema,
@@ -283,7 +295,22 @@ impl MigrationEngine {
                     };
 
                     if rows.is_empty() {
+                        tracing::info!("No hay más filas para leer de {}", table_name);
                         break;
+                    }
+
+                    tracing::info!("Leídas {} filas de {} (offset {})", rows.len(), table_name, offset);
+
+                    // Mostrar primera fila para debugging
+                    if offset == 0 && !rows.is_empty() {
+                        let first_row_preview: Vec<String> = rows[0].iter()
+                            .take(3)
+                            .map(|v| match v {
+                                Some(s) => format!("\"{}\"", s.chars().take(30).collect::<String>()),
+                                None => "NULL".to_string()
+                            })
+                            .collect();
+                        tracing::info!("Preview primera fila de {}: {:?}", table_name, first_row_preview);
                     }
 
                     // Convertir filas a valores dinámicos
@@ -299,6 +326,8 @@ impl MigrationEngine {
                     }
 
                     // Insertar en PostgreSQL
+                    tracing::info!("Enviando {} filas convertidas a PostgreSQL para {}", converted_rows.len(), table_name);
+
                     let result = postgres.insert_rows(
                         &table.schema,
                         &table.name,
@@ -308,10 +337,18 @@ impl MigrationEngine {
 
                     match result {
                         Ok(r) => {
+                            tracing::info!("Resultado insert {}: {} insertadas, {} fallidas",
+                                table_name, r.inserted, r.failed);
+                            if !r.errors.is_empty() {
+                                for err in &r.errors {
+                                    tracing::warn!("Error detalle: {}", err);
+                                }
+                            }
                             total_migrated += r.inserted as i64;
                         }
                         Err(e) => {
                             let error_msg = format!("Error insertando: {}", e);
+                            tracing::error!("{}", error_msg);
                             if let Some(sender) = &event_sender {
                                 let _ = sender.send(MigrationEvent::MigrationError(table_name.clone(), error_msg));
                             }
@@ -437,9 +474,8 @@ fn convert_string_data(data: &Option<String>, column: &ColumnInfo, json_nulled: 
                         _ => DynamicValue::Text(s.clone()),
                     }
                 } else if pg_type == "UUID" {
-                    uuid::Uuid::parse_str(s)
-                        .map(DynamicValue::Uuid)
-                        .unwrap_or(DynamicValue::Text(s.clone()))
+                    // Keep as text, PostgreSQL will handle the UUID conversion
+                    DynamicValue::Text(s.clone())
                 } else {
                     DynamicValue::Text(s.clone())
                 }

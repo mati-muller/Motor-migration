@@ -131,6 +131,12 @@ impl MigrationApp {
         // Procesar eventos
         for event in events {
             match event {
+                MigrationEvent::ConnectionSuccess(tables) => {
+                    let timestamp = Utc::now().format("%H:%M:%S");
+                    self.logs.push(format!("[{}] Conexion exitosa! {} tablas encontradas", timestamp, tables.len()));
+                    self.tables = tables;
+                    self.state = AppState::TableSelection;
+                }
                 MigrationEvent::AnalysisStarted(table) => {
                     let timestamp = Utc::now().format("%H:%M:%S");
                     self.logs.push(format!("[{}] Analizando: {}", timestamp, table));
@@ -175,18 +181,27 @@ impl MigrationApp {
                         prog.end_time = Some(Utc::now());
                     }
                 }
-                MigrationEvent::MigrationError(table, error) => {
+                MigrationEvent::MigrationError(context, error) => {
                     let timestamp = Utc::now().format("%H:%M:%S");
-                    self.logs.push(format!("[{}] ERROR en {}: {}", timestamp, table, error));
-                    if let Some(prog) = self.progress.get_mut(&table) {
+                    self.logs.push(format!("[{}] ERROR en {}: {}", timestamp, context, error));
+                    self.error = Some(format!("{}: {}", context, error));
+                    // Si el error es de conexión, volver a config
+                    if context == "connection" || context == "fetch_tables" {
+                        self.state = AppState::Config;
+                    } else if let Some(prog) = self.progress.get_mut(&context) {
                         prog.status = MigrationStatus::Failed(error.clone());
                         prog.errors.push(error);
                     }
                 }
                 MigrationEvent::AllComplete => {
                     let timestamp = Utc::now().format("%H:%M:%S");
-                    self.logs.push(format!("[{}] Migracion completada!", timestamp));
-                    self.state = AppState::Complete;
+                    self.logs.push(format!("[{}] Operacion completada!", timestamp));
+                    // Solo cambiar a Complete si estábamos migrando
+                    if self.state == AppState::Migrating {
+                        self.state = AppState::Complete;
+                    } else if self.state == AppState::Analyzing {
+                        self.state = AppState::ColumnConfig;
+                    }
                 }
             }
         }
@@ -721,18 +736,12 @@ impl MigrationApp {
                     Ok(_) => {
                         match engine.fetch_tables().await {
                             Ok(tables) => {
-                                // Enviar tablas de vuelta (simplificado)
-                                for table in tables {
-                                    let _ = tx.send(MigrationEvent::AnalysisComplete(
-                                        format!("__TABLE__:{}", table.full_name),
-                                        vec![]
-                                    ));
-                                }
-                                let _ = tx.send(MigrationEvent::AllComplete);
+                                // Enviar las tablas con el nuevo evento
+                                let _ = tx.send(MigrationEvent::ConnectionSuccess(tables));
                             }
                             Err(e) => {
                                 let _ = tx.send(MigrationEvent::MigrationError(
-                                    "connection".to_string(),
+                                    "fetch_tables".to_string(),
                                     e.to_string()
                                 ));
                             }
@@ -868,38 +877,6 @@ impl eframe::App for MigrationApp {
         self.process_events();
 
         // Manejar transiciones de estado basadas en eventos
-        if self.state == AppState::Connecting {
-            // Verificar si llegaron tablas
-            let table_events: Vec<String> = self.analyzed_columns.keys()
-                .filter(|k| k.starts_with("__TABLE__:"))
-                .cloned()
-                .collect();
-
-            if !table_events.is_empty() {
-                for key in table_events {
-                    let table_name = key.replace("__TABLE__:", "");
-                    let parts: Vec<&str> = table_name.split('.').collect();
-                    if parts.len() == 2 {
-                        // Esto es simplificado - en realidad necesitamos los datos reales
-                    }
-                    self.analyzed_columns.remove(&key);
-                }
-                // Si tenemos tablas, transicionar
-                if !self.tables.is_empty() {
-                    self.state = AppState::TableSelection;
-                    self.log("Conexion exitosa!");
-                }
-            }
-        }
-
-        if self.state == AppState::Analyzing {
-            // Si todas las tablas fueron analizadas, transicionar
-            if self.analyzed_columns.len() >= self.selected_tables.len() && !self.selected_tables.is_empty() {
-                self.state = AppState::ColumnConfig;
-                self.log("Analisis completado!");
-            }
-        }
-
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Motor de Migracion SQL Server -> PostgreSQL");
             ui.separator();

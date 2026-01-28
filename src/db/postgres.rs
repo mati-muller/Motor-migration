@@ -6,14 +6,14 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use serde_json::Value as JsonValue;
 
-use super::types::{TableInfo, ColumnInfo, ConnectionConfig};
+use super::types::{TableInfo, ColumnInfo};
 
 pub struct PostgresConnection {
     client: Arc<Mutex<Client>>,
 }
 
 impl PostgresConnection {
-    pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
+    pub async fn connect(config: &super::ConnectionConfig) -> Result<Self> {
         let conn_string = format!(
             "host={} port={} dbname={} user={} password={}",
             config.postgres_host,
@@ -50,26 +50,12 @@ impl PostgresConnection {
                 if col.should_convert_to_json { "JSONB" } else { &col.pg_type }
             );
 
-            if !col.is_nullable && !col.should_convert_to_json {
-                col_def.push_str(" NOT NULL");
-            }
-
+            // No poner NOT NULL para evitar problemas con datos faltantes
             if col.is_identity {
                 col_def = format!("\"{}\" SERIAL", col.name);
-                if !col.is_nullable {
-                    col_def.push_str(" NOT NULL");
-                }
             }
 
             columns_sql.push(col_def);
-        }
-
-        // Agregar clave primaria
-        if !table.primary_keys.is_empty() {
-            let pk_cols: Vec<String> = table.primary_keys.iter()
-                .map(|pk| format!("\"{}\"", pk))
-                .collect();
-            columns_sql.push(format!("PRIMARY KEY ({})", pk_cols.join(", ")));
         }
 
         // Crear esquema si no existe
@@ -89,10 +75,12 @@ impl PostgresConnection {
         client.execute(&create_schema, &[]).await?;
         client.execute(&create_table, &[]).await?;
 
+        tracing::info!("Tabla creada: {}.{}", table.schema, table.name);
+
         Ok(())
     }
 
-    /// Inserta filas en una tabla
+    /// Inserta filas en una tabla usando texto plano (más robusto)
     pub async fn insert_rows(
         &self,
         schema: &str,
@@ -100,35 +88,58 @@ impl PostgresConnection {
         columns: &[ColumnInfo],
         rows: Vec<Vec<DynamicValue>>,
     ) -> Result<InsertResult> {
+        if rows.is_empty() {
+            tracing::warn!("insert_rows: No hay filas para insertar en {}.{}", schema, table);
+            return Ok(InsertResult::default());
+        }
+
+        if columns.is_empty() {
+            tracing::error!("insert_rows: No hay columnas definidas para {}.{}", schema, table);
+            return Ok(InsertResult::default());
+        }
+
+        tracing::info!("insert_rows: Insertando {} filas en {}.{} con {} columnas",
+            rows.len(), schema, table, columns.len());
+
         let client = self.client.lock().await;
 
         let col_names: Vec<String> = columns.iter()
             .map(|c| format!("\"{}\"", c.name))
             .collect();
 
-        let placeholders: Vec<String> = (1..=columns.len())
-            .map(|i| format!("${}", i))
-            .collect();
-
-        let insert_sql = format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({})",
-            schema,
-            table,
-            col_names.join(", "),
-            placeholders.join(", ")
-        );
-
         let mut result = InsertResult::default();
 
-        for row in rows {
-            let params: Vec<&(dyn ToSql + Sync)> = row.iter()
-                .map(|v| v as &(dyn ToSql + Sync))
-                .collect();
+        // Insertar fila por fila para mejor manejo de errores
+        for (row_idx, row) in rows.iter().enumerate() {
+            let mut values: Vec<String> = Vec::new();
 
-            match client.execute(&insert_sql, &params).await {
+            for (i, val) in row.iter().enumerate() {
+                let col = &columns[i];
+                let sql_value = val.to_sql_string(col.should_convert_to_json);
+                values.push(sql_value);
+            }
+
+            let insert_sql = format!(
+                "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({})",
+                schema,
+                table,
+                col_names.join(", "),
+                values.join(", ")
+            );
+
+            // Log primera fila para debugging
+            if row_idx == 0 {
+                tracing::debug!("SQL de primera fila: {}", &insert_sql[..insert_sql.len().min(500)]);
+            }
+
+            match client.execute(&insert_sql, &[]).await {
                 Ok(_) => result.inserted += 1,
                 Err(e) => {
-                    result.errors.push(format!("Error insertando fila: {}", e));
+                    let err_msg = format!("Error insertando en {}.{}: {}", schema, table, e);
+                    tracing::warn!("{}", err_msg);
+                    if result.errors.len() < 10 {
+                        result.errors.push(err_msg);
+                    }
                     result.failed += 1;
                 }
             }
@@ -137,16 +148,16 @@ impl PostgresConnection {
         Ok(result)
     }
 
-    /// Inserta filas usando COPY para mayor velocidad
-    pub async fn bulk_insert(
+    /// Inserción por lotes más eficiente
+    pub async fn insert_batch(
         &self,
         schema: &str,
         table: &str,
         columns: &[ColumnInfo],
-        rows: &[Vec<String>],
-    ) -> Result<u64> {
+        rows: Vec<Vec<DynamicValue>>,
+    ) -> Result<InsertResult> {
         if rows.is_empty() {
-            return Ok(0);
+            return Ok(InsertResult::default());
         }
 
         let client = self.client.lock().await;
@@ -155,21 +166,21 @@ impl PostgresConnection {
             .map(|c| format!("\"{}\"", c.name))
             .collect();
 
-        // Construir INSERT masivo
-        let mut values_parts = Vec::new();
-        let mut param_idx = 1;
-        let mut all_params: Vec<String> = Vec::new();
+        let mut result = InsertResult::default();
 
-        for row in rows {
-            let row_placeholders: Vec<String> = row.iter()
-                .map(|_| {
-                    let p = format!("${}", param_idx);
-                    param_idx += 1;
-                    p
-                })
-                .collect();
-            values_parts.push(format!("({})", row_placeholders.join(", ")));
-            all_params.extend(row.iter().cloned());
+        // Construir INSERT con múltiples VALUES
+        let mut all_values: Vec<String> = Vec::new();
+
+        for row in &rows {
+            let mut row_values: Vec<String> = Vec::new();
+
+            for (i, val) in row.iter().enumerate() {
+                let col = &columns[i];
+                let sql_value = val.to_sql_string(col.should_convert_to_json);
+                row_values.push(sql_value);
+            }
+
+            all_values.push(format!("({})", row_values.join(", ")));
         }
 
         let insert_sql = format!(
@@ -177,15 +188,22 @@ impl PostgresConnection {
             schema,
             table,
             col_names.join(", "),
-            values_parts.join(", ")
+            all_values.join(", ")
         );
 
-        let params: Vec<&(dyn ToSql + Sync)> = all_params.iter()
-            .map(|s| s as &(dyn ToSql + Sync))
-            .collect();
+        match client.execute(&insert_sql, &[]).await {
+            Ok(count) => {
+                result.inserted = count;
+            }
+            Err(e) => {
+                let err_msg = format!("Error en batch insert: {}", e);
+                tracing::warn!("{}", err_msg);
+                result.errors.push(err_msg);
+                result.failed = rows.len() as u64;
+            }
+        }
 
-        let affected = client.execute(&insert_sql, &params).await?;
-        Ok(affected)
+        Ok(result)
     }
 
     /// Verifica la conexión
@@ -196,6 +214,7 @@ impl PostgresConnection {
     }
 
     /// Verifica si una tabla existe
+    #[allow(dead_code)]
     pub async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         let client = self.client.lock().await;
         let query = "SELECT EXISTS (
@@ -208,21 +227,13 @@ impl PostgresConnection {
     }
 
     /// Obtiene el conteo de filas de una tabla
+    #[allow(dead_code)]
     pub async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
         let client = self.client.lock().await;
         let query = format!("SELECT COUNT(*) FROM \"{}\".\"{}\"", schema, table);
         let row = client.query_one(&query, &[]).await?;
         let count: i64 = row.get(0);
         Ok(count)
-    }
-
-    /// Trunca una tabla (solo si el usuario lo solicita explícitamente)
-    #[allow(dead_code)]
-    pub async fn truncate_table(&self, schema: &str, table: &str) -> Result<()> {
-        let client = self.client.lock().await;
-        let query = format!("TRUNCATE TABLE \"{}\".\"{}\";", schema, table);
-        client.execute(&query, &[]).await?;
-        Ok(())
     }
 }
 
@@ -235,12 +246,38 @@ pub enum DynamicValue {
     Float(f64),
     Text(String),
     Json(JsonValue),
-    Bytes(Vec<u8>),
-    Uuid(uuid::Uuid),
-    Timestamp(chrono::NaiveDateTime),
-    TimestampTz(chrono::DateTime<chrono::Utc>),
-    Date(chrono::NaiveDate),
-    Time(chrono::NaiveTime),
+}
+
+impl DynamicValue {
+    /// Convierte el valor a string SQL escapado
+    pub fn to_sql_string(&self, is_json_column: bool) -> String {
+        match self {
+            DynamicValue::Null => "NULL".to_string(),
+            DynamicValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            DynamicValue::Int(i) => i.to_string(),
+            DynamicValue::Float(f) => {
+                if f.is_nan() || f.is_infinite() {
+                    "NULL".to_string()
+                } else {
+                    f.to_string()
+                }
+            }
+            DynamicValue::Text(s) => {
+                // Escapar comillas simples duplicándolas
+                let escaped = s.replace('\'', "''");
+                format!("'{}'", escaped)
+            }
+            DynamicValue::Json(j) => {
+                if is_json_column {
+                    let json_str = j.to_string().replace('\'', "''");
+                    format!("'{}'::jsonb", json_str)
+                } else {
+                    let escaped = j.to_string().replace('\'', "''");
+                    format!("'{}'", escaped)
+                }
+            }
+        }
+    }
 }
 
 impl ToSql for DynamicValue {
@@ -256,12 +293,6 @@ impl ToSql for DynamicValue {
             DynamicValue::Float(v) => v.to_sql(ty, out),
             DynamicValue::Text(v) => v.to_sql(ty, out),
             DynamicValue::Json(v) => v.to_sql(ty, out),
-            DynamicValue::Bytes(v) => v.to_sql(ty, out),
-            DynamicValue::Uuid(v) => v.to_sql(ty, out),
-            DynamicValue::Timestamp(v) => v.to_sql(ty, out),
-            DynamicValue::TimestampTz(v) => v.to_sql(ty, out),
-            DynamicValue::Date(v) => v.to_sql(ty, out),
-            DynamicValue::Time(v) => v.to_sql(ty, out),
         }
     }
 

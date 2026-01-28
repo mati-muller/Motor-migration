@@ -224,6 +224,11 @@ impl SqlServerConnection {
     /// Lee filas de una tabla con paginación
     /// Retorna los datos como strings para simplicidad
     pub async fn read_rows(&self, schema: &str, table: &str, columns: &[String], offset: i64, limit: i64) -> Result<Vec<Vec<Option<String>>>> {
+        if columns.is_empty() {
+            tracing::error!("read_rows: No hay columnas para leer de [{}].[{}]", schema, table);
+            return Ok(Vec::new());
+        }
+
         let columns_str = columns.iter()
             .map(|c| format!("CAST([{}] AS NVARCHAR(MAX))", c))
             .collect::<Vec<_>>()
@@ -234,9 +239,13 @@ impl SqlServerConnection {
             columns_str, schema, table, offset, limit
         );
 
+        tracing::debug!("read_rows query: {}", &query[..query.len().min(200)]);
+
         let mut client = self.client.lock().await;
         let stream = client.query(&query, &[]).await?;
         let rows = stream.into_first_result().await?;
+
+        tracing::info!("read_rows: {} filas obtenidas de [{}].[{}] (offset: {})", rows.len(), schema, table, offset);
 
         let result: Vec<Vec<Option<String>>> = rows
             .into_iter()
