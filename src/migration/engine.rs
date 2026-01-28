@@ -139,18 +139,17 @@ impl MigrationEngine {
     }
 
     /// Analiza tablas en paralelo para detectar columnas JSON
+    /// Cada tabla usa su propia conexión para paralelismo real
     pub async fn analyze_tables(&self, table_names: Vec<String>) -> Result<HashMap<String, Vec<ColumnInfo>>> {
-        let sqlserver = self.sqlserver.as_ref()
-            .context("No hay conexión a SQL Server")?;
-
         let mut results = HashMap::new();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.parallel_analysis));
+        let conn_config = self.conn_config.clone();
 
         let futures: Vec<_> = table_names.into_iter().map(|table_name| {
-            let sqlserver = Arc::clone(sqlserver);
             let semaphore = Arc::clone(&semaphore);
             let analyzer = JsonAnalyzer::new(self.config.json_sample_size, self.config.json_threshold);
             let event_sender = self.event_sender.clone();
+            let conn_config = conn_config.clone();
 
             async move {
                 let _permit = semaphore.acquire().await.unwrap();
@@ -158,6 +157,12 @@ impl MigrationEngine {
                 if let Some(sender) = &event_sender {
                     let _ = sender.send(MigrationEvent::AnalysisStarted(table_name.clone()));
                 }
+
+                // Crear conexión propia para esta tabla
+                let sqlserver = match SqlServerConnection::connect(&conn_config).await {
+                    Ok(conn) => conn,
+                    Err(_) => return (table_name, Vec::new()),
+                };
 
                 let parts: Vec<&str> = table_name.split('.').collect();
                 if parts.len() != 2 {
@@ -225,26 +230,38 @@ impl MigrationEngine {
     }
 
     /// Migra las tablas seleccionadas
+    /// Cada tabla usa su propia conexión para paralelismo real
     pub async fn migrate_tables(&self, tables_to_migrate: Vec<TableInfo>) -> Result<()> {
-        let sqlserver = self.sqlserver.as_ref()
-            .context("No hay conexión a SQL Server")?;
         let postgres = self.postgres.as_ref()
             .context("No hay conexión a PostgreSQL")?;
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.parallel_migration));
+        let conn_config = self.conn_config.clone();
 
         let futures: Vec<_> = tables_to_migrate.into_iter().map(|table| {
-            let sqlserver = Arc::clone(sqlserver);
             let postgres = Arc::clone(postgres);
             let semaphore = Arc::clone(&semaphore);
             let batch_size = self.config.batch_size;
             let progress = Arc::clone(&self.progress);
             let event_sender = self.event_sender.clone();
+            let conn_config = conn_config.clone();
 
             async move {
                 let _permit = semaphore.acquire().await.unwrap();
 
                 let table_name = table.full_name.clone();
+
+                // Crear conexión propia a SQL Server para esta tabla
+                let sqlserver = match SqlServerConnection::connect(&conn_config).await {
+                    Ok(conn) => Arc::new(conn),
+                    Err(e) => {
+                        let error_msg = format!("Error conectando SQL Server: {}", e);
+                        if let Some(sender) = &event_sender {
+                            let _ = sender.send(MigrationEvent::MigrationError(table_name.clone(), error_msg));
+                        }
+                        return;
+                    }
+                };
 
                 // Inicializar progreso
                 {
@@ -284,7 +301,10 @@ impl MigrationEngine {
                     return;
                 }
 
+                tracing::info!("{}: Iniciando migración de {} filas", table_name, table.row_count);
+
                 loop {
+                    let read_start = std::time::Instant::now();
                     let rows = match sqlserver.read_rows(
                         &table.schema,
                         &table.name,
@@ -295,19 +315,24 @@ impl MigrationEngine {
                         Ok(r) => r,
                         Err(e) => {
                             let error_msg = format!("Error leyendo filas: {}", e);
+                            tracing::error!("{}: {}", table_name, error_msg);
                             if let Some(sender) = &event_sender {
                                 let _ = sender.send(MigrationEvent::MigrationError(table_name.clone(), error_msg));
                             }
                             break;
                         }
                     };
+                    let read_time = read_start.elapsed();
 
                     if rows.is_empty() {
-                        tracing::info!("No hay más filas para leer de {}", table_name);
+                        tracing::info!("{}: Migración completada", table_name);
                         break;
                     }
 
+                    tracing::info!("{}: Leídas {} filas en {:?}", table_name, rows.len(), read_time);
+
                     // Convertir filas a valores dinámicos
+                    let convert_start = std::time::Instant::now();
                     let mut converted_rows = Vec::new();
                     for row in &rows {
                         let mut converted_row = Vec::new();
@@ -318,14 +343,19 @@ impl MigrationEngine {
                         }
                         converted_rows.push(converted_row);
                     }
+                    let convert_time = convert_start.elapsed();
 
                     // Insertar en PostgreSQL
+                    let insert_start = std::time::Instant::now();
                     let result = postgres.insert_rows(
                         &table.schema,
                         &table.name,
                         &table.columns,
                         converted_rows
                     ).await;
+                    let insert_time = insert_start.elapsed();
+
+                    tracing::info!("{}: Convertido en {:?}, Insertado en {:?}", table_name, convert_time, insert_time);
 
                     match result {
                         Ok(r) => {
