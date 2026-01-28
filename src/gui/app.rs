@@ -336,133 +336,172 @@ impl MigrationApp {
 
     fn render_table_selection(&mut self, ui: &mut egui::Ui) {
         ui.heading("Seleccion de Tablas a Migrar");
-        ui.add_space(5.0);
-        ui.label("Selecciona SOLO las tablas que quieres migrar:");
         ui.add_space(10.0);
 
-        // Barra de búsqueda y botones
-        ui.horizontal(|ui| {
-            ui.label("Buscar:");
-            ui.add(egui::TextEdit::singleline(&mut self.table_search).desired_width(200.0));
-        });
+        // Panel izquierdo: Selector rapido + Estadisticas
+        ui.columns(2, |columns| {
+            // COLUMNA IZQUIERDA: Controles
+            columns[0].group(|ui| {
+                ui.heading("Seleccion Rapida");
+                ui.add_space(5.0);
 
-        ui.add_space(5.0);
-
-        ui.horizontal(|ui| {
-            if ui.button("Seleccionar Todas").clicked() {
-                for table in &self.tables {
-                    self.selected_tables.insert(table.full_name.clone());
-                }
-            }
-
-            if ui.button("Deseleccionar Todas").clicked() {
-                self.selected_tables.clear();
-            }
-
-            if ui.button("Invertir Seleccion").clicked() {
-                let all_tables: std::collections::HashSet<String> = self.tables.iter()
-                    .map(|t| t.full_name.clone())
-                    .collect();
-                let new_selection: std::collections::HashSet<String> = all_tables
-                    .difference(&self.selected_tables)
-                    .cloned()
-                    .collect();
-                self.selected_tables = new_selection;
-            }
-
-            // Seleccionar solo las que coinciden con búsqueda
-            if !self.table_search.is_empty() {
-                if ui.button("Seleccionar Filtradas").clicked() {
-                    let search_lower = self.table_search.to_lowercase();
+                // Botones de selección rápida
+                if ui.button("MIGRAR TODAS LAS TABLAS").clicked() {
                     for table in &self.tables {
-                        if table.full_name.to_lowercase().contains(&search_lower) {
-                            self.selected_tables.insert(table.full_name.clone());
-                        }
+                        self.selected_tables.insert(table.full_name.clone());
                     }
                 }
-            }
-        });
 
-        ui.add_space(10.0);
+                ui.add_space(5.0);
 
-        // Estadísticas
-        let total_tables = self.tables.len();
-        let selected_count = self.selected_tables.len();
-        let selected_rows: i64 = self.tables.iter()
-            .filter(|t| self.selected_tables.contains(&t.full_name))
-            .map(|t| t.row_count)
-            .sum();
-        let total_rows: i64 = self.tables.iter().map(|t| t.row_count).sum();
+                if ui.button("Limpiar seleccion").clicked() {
+                    self.selected_tables.clear();
+                }
 
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("Tablas: {}/{}", selected_count, total_tables));
+                if ui.button("Invertir seleccion").clicked() {
+                    let all: HashSet<String> = self.tables.iter().map(|t| t.full_name.clone()).collect();
+                    self.selected_tables = all.difference(&self.selected_tables).cloned().collect();
+                }
+
+                ui.add_space(10.0);
                 ui.separator();
-                ui.label(format!("Filas a migrar: {} de {}",
-                    format_number(selected_rows),
-                    format_number(total_rows)));
-            });
-        });
+                ui.add_space(5.0);
 
-        ui.add_space(10.0);
+                // Dropdown de búsqueda para agregar tablas
+                ui.label("Agregar tabla:");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.table_search)
+                        .hint_text("Escribe para buscar...")
+                        .desired_width(180.0));
 
-        // Lista de tablas
-        let search_lower = self.table_search.to_lowercase();
-
-        egui::ScrollArea::vertical()
-            .max_height(350.0)
-            .show(ui, |ui| {
-                // Agrupar por esquema
-                let mut current_schema = String::new();
-
-                for table in &self.tables {
-                    if !search_lower.is_empty() && !table.full_name.to_lowercase().contains(&search_lower) {
-                        continue;
-                    }
-
-                    // Mostrar encabezado de esquema
-                    if table.schema != current_schema {
-                        current_schema = table.schema.clone();
-                        ui.add_space(5.0);
-                        ui.horizontal(|ui| {
-                            ui.strong(format!("[{}]", current_schema));
-                            // Botón para seleccionar todo el esquema
-                            if ui.small_button("+ todo").clicked() {
-                                for t in &self.tables {
-                                    if t.schema == current_schema {
-                                        self.selected_tables.insert(t.full_name.clone());
-                                    }
-                                }
+                    if ui.button("+").clicked() && !self.table_search.is_empty() {
+                        let search = self.table_search.to_lowercase();
+                        for table in &self.tables {
+                            if table.full_name.to_lowercase().contains(&search) {
+                                self.selected_tables.insert(table.full_name.clone());
                             }
-                            if ui.small_button("- todo").clicked() {
-                                for t in &self.tables {
-                                    if t.schema == current_schema {
-                                        self.selected_tables.remove(&t.full_name);
+                        }
+                        self.table_search.clear();
+                    }
+                });
+
+                // Mostrar coincidencias como dropdown
+                if !self.table_search.is_empty() {
+                    let search_lower = self.table_search.to_lowercase();
+                    let matches: Vec<_> = self.tables.iter()
+                        .filter(|t| t.full_name.to_lowercase().contains(&search_lower))
+                        .take(10)
+                        .collect();
+
+                    if !matches.is_empty() {
+                        ui.group(|ui| {
+                            for table in matches {
+                                let is_selected = self.selected_tables.contains(&table.full_name);
+                                let label = if is_selected {
+                                    format!("[x] {}", table.full_name)
+                                } else {
+                                    format!("    {}", table.full_name)
+                                };
+
+                                if ui.selectable_label(is_selected, label).clicked() {
+                                    if is_selected {
+                                        self.selected_tables.remove(&table.full_name);
+                                    } else {
+                                        self.selected_tables.insert(table.full_name.clone());
                                     }
                                 }
                             }
                         });
                     }
+                }
 
-                    let mut selected = self.selected_tables.contains(&table.full_name);
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(5.0);
+
+                // Seleccionar por esquema
+                ui.label("Seleccionar por esquema:");
+                let schemas: Vec<String> = self.tables.iter()
+                    .map(|t| t.schema.clone())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                for schema in &schemas {
                     ui.horizontal(|ui| {
-                        ui.add_space(20.0); // Indentación
-                        if ui.checkbox(&mut selected, "").changed() {
-                            if selected {
-                                self.selected_tables.insert(table.full_name.clone());
-                            } else {
-                                self.selected_tables.remove(&table.full_name);
+                        ui.label(format!("[{}]", schema));
+                        if ui.small_button("+").clicked() {
+                            for t in &self.tables {
+                                if &t.schema == schema {
+                                    self.selected_tables.insert(t.full_name.clone());
+                                }
                             }
                         }
-                        ui.label(&table.name);
-                        ui.weak(format!("({} filas)", format_number(table.row_count)));
+                        if ui.small_button("-").clicked() {
+                            for t in &self.tables {
+                                if &t.schema == schema {
+                                    self.selected_tables.remove(&t.full_name);
+                                }
+                            }
+                        }
                     });
                 }
             });
 
+            // COLUMNA DERECHA: Tablas seleccionadas
+            columns[1].group(|ui| {
+                // Estadísticas
+                let total_tables = self.tables.len();
+                let selected_count = self.selected_tables.len();
+                let selected_rows: i64 = self.tables.iter()
+                    .filter(|t| self.selected_tables.contains(&t.full_name))
+                    .map(|t| t.row_count)
+                    .sum();
+
+                ui.heading(format!("Tablas a migrar: {}/{}", selected_count, total_tables));
+                ui.label(format!("Total filas: {}", format_number(selected_rows)));
+                ui.add_space(5.0);
+
+                // Lista de tablas seleccionadas (con opción de quitar)
+                egui::ScrollArea::vertical()
+                    .max_height(350.0)
+                    .show(ui, |ui| {
+                        if self.selected_tables.is_empty() {
+                            ui.weak("No hay tablas seleccionadas");
+                            ui.weak("Usa los controles de la izquierda para agregar tablas");
+                        } else {
+                            // Mostrar tablas seleccionadas agrupadas por esquema
+                            let mut selected_by_schema: HashMap<String, Vec<&TableInfo>> = HashMap::new();
+                            for table in &self.tables {
+                                if self.selected_tables.contains(&table.full_name) {
+                                    selected_by_schema.entry(table.schema.clone())
+                                        .or_insert_with(Vec::new)
+                                        .push(table);
+                                }
+                            }
+
+                            for (schema, tables) in &selected_by_schema {
+                                ui.collapsing(format!("[{}] ({} tablas)", schema, tables.len()), |ui| {
+                                    for table in tables {
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("x").clicked() {
+                                                self.selected_tables.remove(&table.full_name);
+                                            }
+                                            ui.label(&table.name);
+                                            ui.weak(format!("({})", format_number(table.row_count)));
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    });
+            });
+        });
+
         ui.add_space(15.0);
 
-        // Botón de acción
+        // Botón de acción principal
+        let selected_count = self.selected_tables.len();
         ui.horizontal(|ui| {
             if selected_count == 0 {
                 ui.label("Selecciona al menos una tabla para continuar");
