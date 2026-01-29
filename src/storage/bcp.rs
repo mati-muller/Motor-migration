@@ -138,6 +138,9 @@ impl BcpExporter {
         tracing::info!("Exportando {}.{} con BCP ({:?})...", schema, table, self.mode);
         tracing::info!("Conectando a: {}", server_with_port);
 
+        // Row terminator único que no debería aparecer en los datos
+        const ROW_TERMINATOR: &str = "|||ROW|||";
+
         let output = match &self.mode {
             BcpMode::Local => {
                 Command::new("bcp")
@@ -146,8 +149,8 @@ impl BcpExporter {
                         "queryout",
                         output_path.to_str().unwrap(),
                         "-c",                    // Character mode (text)
-                        "-t\t",                  // TAB delimiter (safer than comma)
-                        "-r\n",                  // Row terminator
+                        "-t\t",                  // TAB delimiter
+                        "-r", ROW_TERMINATOR,   // Row terminator único
                         "-S", &server_with_port,
                         "-d", &self.database,
                         "-U", &self.user,
@@ -183,8 +186,8 @@ impl BcpExporter {
                         "queryout",
                         &container_output,
                         "-c",                    // Character mode (text)
-                        "-t\t",                  // TAB delimiter (safer than comma)
-                        "-r\n",                  // Row terminator
+                        "-t\t",                  // TAB delimiter
+                        "-r", ROW_TERMINATOR,   // Row terminator único
                         "-S", &server_with_port,
                         "-d", &self.database,
                         "-U", &self.user,
@@ -228,6 +231,9 @@ impl BcpExporter {
         columns: &[String],
         output_path: &Path,
     ) -> Result<ExportResult> {
+        // Row terminator must match the one used in export_table
+        const ROW_TERMINATOR: &str = "|||ROW|||";
+
         // First, create a temp file for the data
         let temp_data_path = output_path.with_extension("tmp");
 
@@ -238,11 +244,11 @@ impl BcpExporter {
         let data = tokio::fs::read_to_string(&temp_data_path).await
             .context("Error leyendo archivo temporal de BCP")?;
 
-        // Create header (TAB-delimited to match BCP output)
+        // Create header (TAB-delimited with custom row terminator)
         let header = columns.join("\t");
 
-        // Write final file with header
-        let final_content = format!("{}\n{}", header, data);
+        // Write final file with header + row terminator
+        let final_content = format!("{}{}{}", header, ROW_TERMINATOR, data);
         tokio::fs::write(output_path, final_content).await
             .context("Error escribiendo archivo final con header")?;
 

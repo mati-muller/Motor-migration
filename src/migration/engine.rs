@@ -344,11 +344,14 @@ impl MigrationEngine {
                     // Convertir filas a valores dinámicos
                     let convert_start = std::time::Instant::now();
                     let mut converted_rows = Vec::new();
+                    let num_columns = table.columns.len();
                     for row in &rows {
                         let mut converted_row = Vec::new();
-                        for (i, col_data) in row.iter().enumerate() {
+                        // Solo procesar hasta el número de columnas definidas
+                        for i in 0..num_columns {
+                            let col_data = row.get(i).cloned().flatten();
                             let column = &table.columns[i];
-                            let value = convert_string_data(col_data, column, &mut json_nulled);
+                            let value = convert_string_data(&col_data, column, &mut json_nulled);
                             converted_row.push(value);
                         }
                         converted_rows.push(converted_row);
@@ -852,11 +855,14 @@ impl MigrationEngine {
                     // Convert rows to dynamic values
                     let convert_start = std::time::Instant::now();
                     let mut converted_rows = Vec::new();
+                    let num_columns = table.columns.len();
                     for row in &rows {
                         let mut converted_row = Vec::new();
-                        for (i, col_data) in row.iter().enumerate() {
+                        // Solo procesar hasta el número de columnas definidas
+                        for i in 0..num_columns {
+                            let col_data = row.get(i).cloned().flatten();
                             let column = &table.columns[i];
-                            let value = convert_string_data(col_data, column, &mut json_nulled);
+                            let value = convert_string_data(&col_data, column, &mut json_nulled);
                             converted_row.push(value);
                         }
                         converted_rows.push(converted_row);

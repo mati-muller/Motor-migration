@@ -271,16 +271,19 @@ impl DynamicValue {
                 }
             }
             DynamicValue::Text(s) => {
-                // Escapar comillas simples duplicándolas
-                let escaped = s.replace('\'', "''");
+                // Remover bytes nulos y escapar comillas simples
+                let sanitized = s.replace('\0', "");
+                let escaped = sanitized.replace('\'', "''");
                 format!("'{}'", escaped)
             }
             DynamicValue::Json(j) => {
+                // Remover bytes nulos del JSON serializado
+                let json_str = j.to_string().replace('\0', "");
                 if is_json_column {
-                    let json_str = j.to_string().replace('\'', "''");
-                    format!("'{}'::jsonb", json_str)
+                    let escaped = json_str.replace('\'', "''");
+                    format!("'{}'::jsonb", escaped)
                 } else {
-                    let escaped = j.to_string().replace('\'', "''");
+                    let escaped = json_str.replace('\'', "''");
                     format!("'{}'", escaped)
                 }
             }

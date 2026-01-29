@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::Read as IoRead;
+
+/// Row terminator used by BCP export (must match bcp.rs)
+const ROW_TERMINATOR: &str = "|||ROW|||";
 
 /// Data source that reads from CSV files exported by BCP
 pub struct FileDataSource {
@@ -25,38 +28,66 @@ impl FileDataSource {
         self.get_file_path(schema, table).exists()
     }
 
-    /// Get the row count from a CSV file (excluding header)
+    /// Read file content and split into rows
+    fn read_raw_rows(&self, schema: &str, table: &str) -> Result<Vec<String>> {
+        let file_path = self.get_file_path(schema, table);
+        let mut file = File::open(&file_path)
+            .context(format!("Error abriendo archivo: {}", file_path.display()))?;
+
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .context("Error leyendo archivo")?;
+
+        // Split by custom row terminator
+        let rows: Vec<String> = content
+            .split(ROW_TERMINATOR)
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Parse a row string into fields (TAB-delimited)
+    fn parse_row(row: &str) -> Vec<Option<String>> {
+        row.split('\t')
+            .map(|field| {
+                let trimmed = field.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// Get the row count from file (excluding header)
     pub fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
-        let file_path = self.get_file_path(schema, table);
-        let file = File::open(&file_path)
-            .context(format!("Error abriendo archivo: {}", file_path.display()))?;
-
-        let reader = BufReader::new(file);
-        let count = reader.lines().count();
-
+        let rows = self.read_raw_rows(schema, table)?;
         // Subtract 1 for header if file has content
-        Ok(if count > 0 { (count - 1) as i64 } else { 0 })
+        Ok(if rows.len() > 1 { (rows.len() - 1) as i64 } else { 0 })
     }
 
-    /// Read column names from CSV header (TAB-delimited from BCP)
+    /// Read column names from header (first row, TAB-delimited)
     pub fn read_columns(&self, schema: &str, table: &str) -> Result<Vec<String>> {
-        let file_path = self.get_file_path(schema, table);
-        let file = File::open(&file_path)
-            .context(format!("Error abriendo archivo: {}", file_path.display()))?;
+        let rows = self.read_raw_rows(schema, table)?;
 
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(b'\t')  // BCP uses TAB delimiter
-            .has_headers(true)
-            .flexible(true)    // Allow variable number of fields
-            .from_reader(file);
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let headers = reader.headers()
-            .context("Error leyendo headers del CSV")?;
+        // First row is the header
+        let header = &rows[0];
+        let columns: Vec<String> = header
+            .split('\t')
+            .map(|s| s.trim().to_string())
+            .collect();
 
-        Ok(headers.iter().map(|s| s.to_string()).collect())
+        Ok(columns)
     }
 
-    /// Read rows from a CSV file with pagination (TAB-delimited from BCP)
+    /// Read rows from file with pagination
     pub fn read_rows(
         &self,
         schema: &str,
@@ -65,19 +96,16 @@ impl FileDataSource {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<Vec<Option<String>>>> {
-        let file_path = self.get_file_path(schema, table);
-        let file = File::open(&file_path)
-            .context(format!("Error abriendo archivo: {}", file_path.display()))?;
+        let raw_rows = self.read_raw_rows(schema, table)?;
 
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(b'\t')  // BCP uses TAB delimiter
-            .has_headers(true)
-            .flexible(true)    // Allow variable number of fields
-            .from_reader(file);
+        if raw_rows.len() <= 1 {
+            return Ok(Vec::new()); // No data rows (only header or empty)
+        }
 
         let mut rows = Vec::new();
 
-        for (i, result) in reader.records().enumerate() {
+        // Skip header (index 0), start from data rows (index 1)
+        for (i, raw_row) in raw_rows.iter().skip(1).enumerate() {
             let idx = i as i64;
 
             // Skip rows before offset
@@ -90,25 +118,7 @@ impl FileDataSource {
                 break;
             }
 
-            let record = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Error leyendo fila {}: {}", i, e);
-                    continue;  // Skip problematic rows
-                }
-            };
-
-            let row: Vec<Option<String>> = record.iter()
-                .map(|field| {
-                    let trimmed = field.trim();
-                    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                })
-                .collect();
-
+            let row = Self::parse_row(raw_row);
             rows.push(row);
         }
 
@@ -138,7 +148,7 @@ impl FileDataSource {
         .context("Error en task de lectura")?
     }
 
-    /// Sample column data for JSON analysis (TAB-delimited from BCP)
+    /// Sample column data for JSON analysis
     pub fn sample_column_for_json(
         &self,
         schema: &str,
@@ -146,28 +156,21 @@ impl FileDataSource {
         column_name: &str,
         sample_size: u32,
     ) -> Result<Vec<Option<String>>> {
-        let file_path = self.get_file_path(schema, table);
-        let file = File::open(&file_path)
-            .context(format!("Error abriendo archivo: {}", file_path.display()))?;
+        let raw_rows = self.read_raw_rows(schema, table)?;
 
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(b'\t')  // BCP uses TAB delimiter
-            .has_headers(true)
-            .flexible(true)    // Allow variable number of fields
-            .from_reader(file);
+        if raw_rows.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // Find column index
-        let headers = reader.headers()
-            .context("Error leyendo headers")?;
-
-        let col_index = headers.iter()
-            .position(|h| h == column_name);
+        // Find column index from header
+        let headers: Vec<&str> = raw_rows[0].split('\t').map(|s| s.trim()).collect();
+        let col_index = headers.iter().position(|h| *h == column_name);
 
         let col_index = match col_index {
             Some(idx) => idx,
             None => {
                 tracing::warn!("Columna '{}' no encontrada en CSV, columnas disponibles: {:?}",
-                    column_name, headers.iter().collect::<Vec<_>>());
+                    column_name, headers);
                 return Ok(Vec::new());
             }
         };
@@ -175,17 +178,14 @@ impl FileDataSource {
         let mut samples = Vec::new();
         let mut count = 0u32;
 
-        for result in reader.records() {
+        // Skip header, iterate data rows
+        for raw_row in raw_rows.iter().skip(1) {
             if count >= sample_size {
                 break;
             }
 
-            let record = match result {
-                Ok(r) => r,
-                Err(_) => continue,  // Skip problematic rows
-            };
-
-            if let Some(field) = record.get(col_index) {
+            let fields: Vec<&str> = raw_row.split('\t').collect();
+            if let Some(field) = fields.get(col_index) {
                 let trimmed = field.trim();
                 if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("NULL") {
                     samples.push(Some(trimmed.to_string()));
@@ -257,16 +257,16 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_read_csv() {
+    fn test_read_with_custom_terminator() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("dbo.test_table.csv");
 
-        // Create test CSV
+        // Create test file with custom row terminator
         let mut file = File::create(&file_path).unwrap();
-        writeln!(file, "id,name,data").unwrap();
-        writeln!(file, "1,John,{{\"key\":\"value\"}}").unwrap();
-        writeln!(file, "2,Jane,NULL").unwrap();
-        writeln!(file, "3,Bob,").unwrap();
+        write!(file, "id\tname\tdata|||ROW|||").unwrap();
+        write!(file, "1\tJohn\t{{\"key\":\"value\"}}|||ROW|||").unwrap();
+        write!(file, "2\tJane\tNULL|||ROW|||").unwrap();
+        write!(file, "3\tBob\t|||ROW|||").unwrap();
 
         let source = FileDataSource::new(dir.path().to_path_buf());
 
@@ -288,14 +288,33 @@ mod tests {
     }
 
     #[test]
+    fn test_multiline_fields() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("dbo.multiline.csv");
+
+        // Create test file with multiline data
+        let mut file = File::create(&file_path).unwrap();
+        write!(file, "id\tdescription|||ROW|||").unwrap();
+        write!(file, "1\tLine 1\nLine 2\nLine 3|||ROW|||").unwrap();
+        write!(file, "2\tSimple|||ROW|||").unwrap();
+
+        let source = FileDataSource::new(dir.path().to_path_buf());
+
+        let rows = source.read_rows("dbo", "multiline", &["id".to_string(), "description".to_string()], 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Some("1".to_string()));
+        assert!(rows[0][1].as_ref().unwrap().contains("Line 1\nLine 2"));
+    }
+
+    #[test]
     fn test_pagination() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("dbo.paged.csv");
 
         let mut file = File::create(&file_path).unwrap();
-        writeln!(file, "id").unwrap();
+        write!(file, "id|||ROW|||").unwrap();
         for i in 1..=10 {
-            writeln!(file, "{}", i).unwrap();
+            write!(file, "{}|||ROW|||", i).unwrap();
         }
 
         let source = FileDataSource::new(dir.path().to_path_buf());
