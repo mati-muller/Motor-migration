@@ -183,7 +183,8 @@ impl PostgresConnection {
                 }
                 Err(batch_err) => {
                     // Si falla el batch, intentar fila por fila para identificar el problema
-                    tracing::warn!("Batch insert falló, intentando fila por fila: {}", batch_err);
+                    tracing::warn!("Batch insert falló: {:?}", batch_err);
+                    tracing::warn!("SQL (primeros 500 chars): {}", &insert_sql[..insert_sql.len().min(500)]);
 
                     for row in chunk {
                         let row_values: Vec<String> = row.iter()

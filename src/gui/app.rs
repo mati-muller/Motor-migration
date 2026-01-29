@@ -3,6 +3,7 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::runtime::Runtime;
 use chrono::Utc;
@@ -16,6 +17,7 @@ enum AppState {
     Config,
     Connecting,
     TableSelection,
+    Exporting,      // Export to S3 (BCP + upload)
     Analyzing,
     ColumnConfig,
     Migrating,
@@ -71,6 +73,12 @@ pub struct MigrationApp {
     total_rows_migrated: i64,
     json_columns_found: usize,
     json_nulled_count: u32,
+
+    // Export to S3
+    export_path: Option<std::path::PathBuf>,
+    export_progress: HashMap<String, bool>, // table -> exported
+    tables_exported: usize,
+    tables_to_export: usize,
 }
 
 impl Default for MigrationApp {
@@ -89,6 +97,16 @@ impl Default for MigrationApp {
                 postgres_database: String::new(),
                 postgres_user: "postgres".to_string(),
                 postgres_password: String::new(),
+                // S3 defaults
+                s3_enabled: false,
+                s3_bucket: String::new(),
+                s3_region: "us-east-1".to_string(),
+                s3_access_key: String::new(),
+                s3_secret_key: String::new(),
+                s3_prefix: String::new(),
+                // BCP defaults (Docker mode by default)
+                bcp_use_docker: true,
+                bcp_docker_image: "mcr.microsoft.com/mssql-tools".to_string(),
             },
             migration_config: MigrationConfig::default(),
             tables: Vec::new(),
@@ -106,6 +124,11 @@ impl Default for MigrationApp {
             total_rows_migrated: 0,
             json_columns_found: 0,
             json_nulled_count: 0,
+            // Export
+            export_path: None,
+            export_progress: HashMap::new(),
+            tables_exported: 0,
+            tables_to_export: 0,
         }
     }
 }
@@ -141,6 +164,44 @@ impl MigrationApp {
                     self.tables = tables;
                     self.state = AppState::TableSelection;
                 }
+                // Export events
+                MigrationEvent::ExportStarted(table) => {
+                    let timestamp = Utc::now().format("%H:%M:%S");
+                    self.logs.push(format!("[{}] Exportando: {}", timestamp, table));
+                }
+                MigrationEvent::ExportProgress(table, current, total) => {
+                    self.tables_exported = current as usize;
+                    self.tables_to_export = total as usize;
+                    self.export_progress.insert(table, false);
+                }
+                MigrationEvent::ExportComplete(table) => {
+                    // Check if this is a path marker
+                    if table.starts_with("__PATH__:") {
+                        let path_str = table.trim_start_matches("__PATH__:");
+                        self.export_path = Some(PathBuf::from(path_str));
+                        let timestamp = Utc::now().format("%H:%M:%S");
+                        self.logs.push(format!("[{}] Archivos exportados a: {}", timestamp, path_str));
+                    } else {
+                        let timestamp = Utc::now().format("%H:%M:%S");
+                        self.logs.push(format!("[{}] Exportado: {}", timestamp, table));
+                        self.export_progress.insert(table, true);
+                        self.tables_exported = self.export_progress.values().filter(|&&v| v).count();
+                    }
+                }
+                MigrationEvent::ExportError(context, error) => {
+                    let timestamp = Utc::now().format("%H:%M:%S");
+                    self.logs.push(format!("[{}] ERROR exportando {}: {}", timestamp, context, error));
+                    self.error = Some(format!("Export {}: {}", context, error));
+                    self.state = AppState::TableSelection;
+                }
+                MigrationEvent::AllExportsComplete => {
+                    let timestamp = Utc::now().format("%H:%M:%S");
+                    self.logs.push(format!("[{}] Exportacion completada!", timestamp));
+                    // Continue to analysis
+                    self.state = AppState::Analyzing;
+                    self.analyze_from_files();
+                }
+                // Analysis events
                 MigrationEvent::AnalysisStarted(table) => {
                     let timestamp = Utc::now().format("%H:%M:%S");
                     self.logs.push(format!("[{}] Analizando: {}", timestamp, table));
@@ -156,6 +217,7 @@ impl MigrationApp {
                     }
                     self.analyzed_columns.insert(table, columns);
                 }
+                // Migration events
                 MigrationEvent::MigrationStarted(table) => {
                     let timestamp = Utc::now().format("%H:%M:%S");
                     self.logs.push(format!("[{}] Migrando: {}", timestamp, table));
@@ -340,6 +402,81 @@ impl MigrationApp {
                 ui.label(format!("Umbral JSON (>= {} para JSONB):", self.migration_config.json_threshold));
                 ui.add(egui::Slider::new(&mut self.migration_config.json_threshold, 0..=100).show_value(true));
             });
+        });
+
+        ui.add_space(20.0);
+
+        // S3 Storage Configuration
+        ui.group(|ui| {
+            ui.heading("S3 Storage (Opcional)");
+            ui.add_space(5.0);
+
+            ui.checkbox(&mut self.conn_config.s3_enabled, "Exportar a S3 antes de migrar (via BCP)");
+
+            if self.conn_config.s3_enabled {
+                ui.add_space(5.0);
+                ui.colored_label(egui::Color32::YELLOW,
+                    "Usa BCP para exportar tablas a CSV, sube a S3, y migra desde archivos.");
+                ui.colored_label(egui::Color32::YELLOW,
+                    "Esto evita carga en la BD SQL Server durante la migracion.");
+                ui.add_space(5.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Bucket:");
+                    ui.text_edit_singleline(&mut self.conn_config.s3_bucket);
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Region:");
+                    ui.text_edit_singleline(&mut self.conn_config.s3_region);
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Access Key:");
+                    ui.text_edit_singleline(&mut self.conn_config.s3_access_key);
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Secret Key:");
+                    ui.add(egui::TextEdit::singleline(&mut self.conn_config.s3_secret_key).password(true));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Prefix (carpeta):");
+                    ui.text_edit_singleline(&mut self.conn_config.s3_prefix);
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // BCP Configuration
+                ui.label("Configuracion BCP:");
+                ui.checkbox(&mut self.conn_config.bcp_use_docker, "Usar BCP via Docker (recomendado)");
+
+                if self.conn_config.bcp_use_docker {
+                    ui.horizontal(|ui| {
+                        ui.label("Imagen Docker:");
+                        ui.text_edit_singleline(&mut self.conn_config.bcp_docker_image);
+                    });
+
+                    // Docker status
+                    if crate::storage::BcpExporter::is_docker_available() {
+                        ui.colored_label(egui::Color32::GREEN, "Docker esta disponible");
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Docker NO esta instalado");
+                    }
+                } else {
+                    // Local BCP status
+                    if crate::storage::BcpExporter::is_local_installed() {
+                        ui.colored_label(egui::Color32::GREEN, "BCP local esta instalado");
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "BCP local NO esta instalado");
+                        if ui.small_button("Ver instrucciones de instalacion").clicked() {
+                            self.error = Some(crate::storage::BcpExporter::get_install_instructions());
+                        }
+                    }
+                }
+            }
         });
 
         ui.add_space(20.0);
@@ -585,7 +722,20 @@ impl MigrationApp {
         ui.horizontal(|ui| {
             if selected_count == 0 {
                 ui.label("Selecciona al menos una tabla para continuar");
+            } else if self.conn_config.s3_enabled {
+                // S3 flow: Export first, then analyze
+                let btn = ui.add_sized(
+                    [300.0, 40.0],
+                    egui::Button::new(format!("Exportar {} Tablas a S3", selected_count))
+                );
+                if btn.clicked() {
+                    self.dropdown_open = false;
+                    self.export_to_s3();
+                }
+                ui.add_space(10.0);
+                ui.label("(BCP exportara y subira a S3)");
             } else {
+                // Direct flow: Analyze directly from SQL Server
                 let btn = ui.add_sized(
                     [300.0, 40.0],
                     egui::Button::new(format!("Analizar {} Tablas Seleccionadas", selected_count))
@@ -862,6 +1012,97 @@ impl MigrationApp {
         });
     }
 
+    fn export_to_s3(&mut self) {
+        self.state = AppState::Exporting;
+        self.export_progress.clear();
+        self.tables_exported = 0;
+        self.log("Exportando tablas con BCP...");
+
+        // Build TableInfo list for selected tables
+        let tables_to_export: Vec<TableInfo> = self.tables.iter()
+            .filter(|t| self.selected_tables.contains(&t.full_name))
+            .cloned()
+            .collect();
+
+        self.tables_to_export = tables_to_export.len();
+
+        let conn_config = self.conn_config.clone();
+        let migration_config = self.migration_config.clone();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.event_receiver = Some(rx);
+
+        let runtime = Arc::clone(&self.runtime);
+
+        std::thread::spawn(move || {
+            runtime.block_on(async {
+                let mut engine = MigrationEngine::new(conn_config, migration_config);
+                engine.set_event_sender(tx.clone());
+
+                if let Err(e) = engine.connect().await {
+                    let _ = tx.send(MigrationEvent::ExportError("connect".to_string(), e.to_string()));
+                    return;
+                }
+
+                match engine.export_to_s3(&tables_to_export).await {
+                    Ok(path) => {
+                        // Send path first, then AllExportsComplete
+                        let _ = tx.send(MigrationEvent::ExportComplete(format!("__PATH__:{}", path.display())));
+                        let _ = tx.send(MigrationEvent::AllExportsComplete);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(MigrationEvent::ExportError("export".to_string(), e.to_string()));
+                    }
+                }
+            });
+        });
+    }
+
+    fn analyze_from_files(&mut self) {
+        self.log("Analizando tablas desde archivos exportados...");
+
+        let export_path = match &self.export_path {
+            Some(p) => p.clone(),
+            None => {
+                self.error = Some("No hay ruta de exportacion".to_string());
+                self.state = AppState::TableSelection;
+                return;
+            }
+        };
+
+        let conn_config = self.conn_config.clone();
+        let migration_config = self.migration_config.clone();
+        let selected: Vec<String> = self.selected_tables.iter().cloned().collect();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.event_receiver = Some(rx);
+
+        let runtime = Arc::clone(&self.runtime);
+
+        std::thread::spawn(move || {
+            runtime.block_on(async {
+                let mut engine = MigrationEngine::new(conn_config, migration_config);
+                engine.set_event_sender(tx.clone());
+
+                // Don't need to connect to SQL Server for file-based analysis
+                // But we do need PostgreSQL for the migration later
+                if let Err(e) = engine.connect().await {
+                    let _ = tx.send(MigrationEvent::MigrationError("connect".to_string(), e.to_string()));
+                    return;
+                }
+
+                match engine.analyze_tables_from_files(selected, &export_path).await {
+                    Ok(_) => {
+                        let _ = tx.send(MigrationEvent::AllComplete);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(MigrationEvent::MigrationError("analysis".to_string(), e.to_string()));
+                    }
+                }
+            });
+        });
+    }
+
     fn start_migration(&mut self) {
         self.state = AppState::Migrating;
         self.start_time = Some(Utc::now());
@@ -901,6 +1142,7 @@ impl MigrationApp {
 
         let conn_config = self.conn_config.clone();
         let migration_config = self.migration_config.clone();
+        let export_path = self.export_path.clone();
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.event_receiver = Some(rx);
@@ -917,8 +1159,16 @@ impl MigrationApp {
                     return;
                 }
 
-                if let Err(e) = engine.migrate_tables(tables_to_migrate).await {
-                    let _ = tx.send(MigrationEvent::MigrationError("migration".to_string(), e.to_string()));
+                // Use file-based migration if we exported to S3
+                if let Some(path) = export_path {
+                    if let Err(e) = engine.migrate_tables_from_files(tables_to_migrate, &path).await {
+                        let _ = tx.send(MigrationEvent::MigrationError("migration".to_string(), e.to_string()));
+                    }
+                } else {
+                    // Direct migration from SQL Server
+                    if let Err(e) = engine.migrate_tables(tables_to_migrate).await {
+                        let _ = tx.send(MigrationEvent::MigrationError("migration".to_string(), e.to_string()));
+                    }
                 }
             });
         });
@@ -939,6 +1189,11 @@ impl MigrationApp {
         self.total_rows_migrated = 0;
         self.json_columns_found = 0;
         self.json_nulled_count = 0;
+        // Export reset
+        self.export_path = None;
+        self.export_progress.clear();
+        self.tables_exported = 0;
+        self.tables_to_export = 0;
     }
 }
 
@@ -959,6 +1214,7 @@ impl eframe::App for MigrationApp {
                     AppState::Config => ("Configuracion", egui::Color32::GRAY),
                     AppState::Connecting => ("Conectando...", egui::Color32::YELLOW),
                     AppState::TableSelection => ("Seleccion de Tablas", egui::Color32::LIGHT_BLUE),
+                    AppState::Exporting => ("Exportando a S3...", egui::Color32::YELLOW),
                     AppState::Analyzing => ("Analizando...", egui::Color32::YELLOW),
                     AppState::ColumnConfig => ("Configuracion de Columnas", egui::Color32::LIGHT_BLUE),
                     AppState::Migrating => ("Migrando...", egui::Color32::YELLOW),
@@ -977,6 +1233,45 @@ impl eframe::App for MigrationApp {
                     ui.label("Conectando a las bases de datos...");
                 }
                 AppState::TableSelection => self.render_table_selection(ui),
+                AppState::Exporting => {
+                    ui.spinner();
+                    ui.heading("Exportando tablas con BCP...");
+                    ui.add_space(10.0);
+
+                    // Progress
+                    let progress = if self.tables_to_export > 0 {
+                        self.tables_exported as f32 / self.tables_to_export as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(egui::ProgressBar::new(progress)
+                        .text(format!("{}/{} tablas exportadas", self.tables_exported, self.tables_to_export)));
+
+                    ui.add_space(10.0);
+
+                    // Export status per table
+                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                        for (table, done) in &self.export_progress {
+                            ui.horizontal(|ui| {
+                                if *done {
+                                    ui.colored_label(egui::Color32::GREEN, "[OK]");
+                                } else {
+                                    ui.colored_label(egui::Color32::YELLOW, "[...]");
+                                }
+                                ui.label(table);
+                            });
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.collapsing("Logs", |ui| {
+                        egui::ScrollArea::vertical().max_height(150.0).stick_to_bottom(true).show(ui, |ui| {
+                            for log in &self.logs {
+                                ui.label(log);
+                            }
+                        });
+                    });
+                }
                 AppState::Analyzing => {
                     ui.spinner();
                     ui.label("Analizando tablas para detectar columnas JSON...");
@@ -993,7 +1288,7 @@ impl eframe::App for MigrationApp {
         });
 
         // Solicitar repintado si hay operaciones en curso
-        if matches!(self.state, AppState::Connecting | AppState::Analyzing | AppState::Migrating) {
+        if matches!(self.state, AppState::Connecting | AppState::Exporting | AppState::Analyzing | AppState::Migrating) {
             ctx.request_repaint();
         }
     }

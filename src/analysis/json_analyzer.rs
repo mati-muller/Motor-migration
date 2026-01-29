@@ -178,6 +178,7 @@ impl JsonAnalyzer {
         let mut invalid_json = 0u32;
         let mut null_count = 0u32;
         let mut looks_like_json = 0u32;
+        let mut numeric_count = 0u32;
 
         for sample in samples {
             match sample {
@@ -186,23 +187,36 @@ impl JsonAnalyzer {
                 Some(s) => {
                     let trimmed = s.trim();
 
-                    // Verificar si parece JSON o estructura de datos
-                    if trimmed.starts_with('{') || trimmed.starts_with('[') ||
-                       trimmed.starts_with("\"{") || trimmed.starts_with("\"[") ||
-                       trimmed.starts_with("'{") || trimmed.starts_with("'[") ||
-                       trimmed.contains("\":") || trimmed.contains("\": ") ||
-                       trimmed.contains("\\\"") {  // También detectar escapes
-                        looks_like_json += 1;
+                    // Check if it's a simple scalar (number or plain string) - these should NOT be JSON
+                    if is_simple_scalar(trimmed) {
+                        numeric_count += 1;
+                        invalid_json += 1;
+                        continue;
                     }
 
-                    // Intentar parsear como JSON
-                    if try_parse_json(trimmed).is_some() {
-                        valid_json += 1;
+                    // Contar como JSON si:
+                    // 1. Empieza con { o [ directamente
+                    // 2. O es JSON escapado como string: "{...}" o "[...]"
+                    if trimmed.starts_with('{') || trimmed.starts_with('[') ||
+                       trimmed.starts_with("\"{") || trimmed.starts_with("\"[") ||
+                       trimmed.starts_with("'{") || trimmed.starts_with("'[") {
+                        looks_like_json += 1;
+                        // Intentar parsear (try_parse_json maneja JSON escapado)
+                        if let Some(json) = try_parse_json(trimmed) {
+                            if json.is_object() || json.is_array() {
+                                valid_json += 1;
+                            } else {
+                                invalid_json += 1;
+                            }
+                        } else {
+                            invalid_json += 1;
+                        }
                     } else if trimmed.starts_with('<') {
-                        // XML cuenta como candidato a JSON
+                        // XML cuenta como candidato
                         looks_like_json += 1;
                         invalid_json += 1;
                     } else {
+                        // Strings simples y otros - NO es JSON
                         invalid_json += 1;
                     }
                 }
@@ -211,6 +225,15 @@ impl JsonAnalyzer {
 
         let total_non_null = valid_json + invalid_json;
         let mut score: u8 = 0;
+
+        // Si la mayoría son escalares simples, NO dar puntos para JSON
+        if total_non_null > 0 {
+            let scalar_ratio = numeric_count as f32 / total_non_null as f32;
+            if scalar_ratio > 0.8 {
+                // 80%+ escalares = no es JSON, retornar score 0
+                return (0, valid_json, invalid_json, null_count);
+            }
+        }
 
         // Puntos por JSON válido detectado (MUY generoso)
         if total_non_null > 0 {
@@ -258,8 +281,8 @@ impl JsonAnalyzer {
     }
 
     /// Convierte un valor a JSON de forma segura
+    /// Deserializa correctamente JSON mal escapado como "{}" o '[...]'
     /// SIEMPRE retorna un valor JSON - nunca pierde datos
-    /// Si no puede parsear como JSON estructurado, lo guarda como JSON string
     pub fn safe_convert_to_json(value: &Option<String>) -> Option<JsonValue> {
         match value {
             None => None,
@@ -267,8 +290,20 @@ impl JsonAnalyzer {
             Some(s) => {
                 let trimmed = s.trim();
 
-                // 1. Intentar parsear JSON en varios formatos
+                // 1. Intentar parsear JSON en varios formatos (esto maneja JSON mal escapado)
                 if let Some(json) = try_parse_json(trimmed) {
+                    // Si es objeto o array, retornarlo directamente (bien deserializado)
+                    if json.is_object() || json.is_array() {
+                        return Some(json);
+                    }
+                    // Si es un string que contiene JSON, intentar parsearlo
+                    if let JsonValue::String(inner) = &json {
+                        if let Some(inner_json) = try_parse_json(inner) {
+                            if inner_json.is_object() || inner_json.is_array() {
+                                return Some(inner_json);
+                            }
+                        }
+                    }
                     return Some(json);
                 }
 
@@ -338,6 +373,37 @@ impl JsonAnalyzer {
             average_score: avg_score,
         }
     }
+}
+
+/// Check if a value is a simple scalar (number or plain string without JSON structure)
+/// These should NOT be converted to JSON - only {} and [] should
+fn is_simple_scalar(s: &str) -> bool {
+    let trimmed = s.trim();
+
+    // Empty string
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Numbers
+    if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
+        return true;
+    }
+
+    // Numbers with thousand separators
+    let cleaned = trimmed.replace(',', "");
+    if cleaned.parse::<f64>().is_ok() {
+        return true;
+    }
+
+    // Check if it looks like JSON structure (object or array)
+    let looks_like_json = trimmed.starts_with('{') || trimmed.starts_with('[') ||
+                          trimmed.starts_with("\"{") || trimmed.starts_with("\"[") ||
+                          trimmed.starts_with("'{") || trimmed.starts_with("'[") ||
+                          trimmed.contains("\":") || trimmed.contains("\":");
+
+    // If it doesn't look like JSON structure, it's a simple scalar
+    !looks_like_json
 }
 
 /// Intenta parsear JSON en varios formatos comunes

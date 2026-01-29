@@ -42,6 +42,7 @@ mod db;
 mod migration;
 mod analysis;
 mod gui;
+mod storage;
 
 use eframe::egui;
 use gui::MigrationApp;

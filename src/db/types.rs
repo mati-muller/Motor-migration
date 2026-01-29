@@ -197,6 +197,18 @@ pub struct ConnectionConfig {
     pub postgres_database: String,
     pub postgres_user: String,
     pub postgres_password: String,
+
+    // S3 Configuration (optional)
+    pub s3_enabled: bool,
+    pub s3_bucket: String,
+    pub s3_region: String,
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+    pub s3_prefix: String,
+
+    // BCP Configuration
+    pub bcp_use_docker: bool,
+    pub bcp_docker_image: String,
 }
 
 impl ConnectionConfig {
