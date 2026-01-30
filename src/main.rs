@@ -41,13 +41,13 @@
 mod db;
 mod migration;
 mod analysis;
-mod gui;
 mod storage;
+mod cli;
 
-use eframe::egui;
-use gui::MigrationApp;
+#[cfg(feature = "gui")]
+mod gui;
 
-fn main() -> eframe::Result<()> {
+fn main() {
     // Inicializar logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -56,21 +56,50 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
-    tracing::info!("Iniciando Motor de Migracion SQL Server -> PostgreSQL");
+    // Check for CLI mode (or if GUI feature is disabled)
+    #[cfg(feature = "gui")]
+    let cli_mode = std::env::args().any(|arg| arg == "--cli");
 
-    // Configuración de la ventana
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([800.0, 600.0])
-            .with_title("Motor de Migracion SQL Server -> PostgreSQL"),
-        ..Default::default()
-    };
+    #[cfg(not(feature = "gui"))]
+    let cli_mode = true;
 
-    // Ejecutar aplicación
-    eframe::run_native(
-        "SQL Migration Engine",
-        options,
-        Box::new(|cc| Ok(Box::new(MigrationApp::new(cc)))),
-    )
+    if cli_mode {
+        tracing::info!("Starting in CLI mode (headless)");
+
+        // Run in CLI mode
+        let rt = tokio::runtime::Runtime::new()
+            .expect("Failed to create Tokio runtime");
+
+        if let Err(e) = rt.block_on(cli::run()) {
+            tracing::error!("Migration failed: {:#}", e);
+            std::process::exit(1);
+        }
+    } else {
+        #[cfg(feature = "gui")]
+        {
+            use eframe::egui;
+            use gui::MigrationApp;
+
+            tracing::info!("Iniciando Motor de Migracion SQL Server -> PostgreSQL (GUI)");
+
+            // Configuración de la ventana
+            let options = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([1200.0, 800.0])
+                    .with_min_inner_size([800.0, 600.0])
+                    .with_title("Motor de Migracion SQL Server -> PostgreSQL"),
+                ..Default::default()
+            };
+
+            // Ejecutar aplicación GUI
+            if let Err(e) = eframe::run_native(
+                "SQL Migration Engine",
+                options,
+                Box::new(|cc| Ok(Box::new(MigrationApp::new(cc)))),
+            ) {
+                tracing::error!("GUI error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 }
