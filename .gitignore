@@ -1,1 +1,26 @@
 /target
+
+# Local configs (sensitive data - never commit)
+/local/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Secrets (never commit)
+**/secrets.yaml
+!**/secrets.yaml.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

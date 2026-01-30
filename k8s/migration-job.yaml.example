@@ -1,0 +1,129 @@
+# Kubernetes Job for SQL Server to PostgreSQL Migration
+#
+# This job runs the migration tool in a Kubernetes cluster.
+# Designed for EKS Fargate but works on any Kubernetes cluster.
+#
+# Prerequisites:
+# 1. Build and push the Docker image to your container registry
+# 2. Create the secrets (see secrets.yaml.example)
+# 3. Ensure network connectivity between the job and both databases
+#
+# Usage:
+#   kubectl apply -f migration-job.yaml
+#   kubectl logs -f job/db-migration
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  namespace: default  # Change to your namespace
+  labels:
+    app: db-migration
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 14400  # 4 hours max (adjust as needed)
+  ttlSecondsAfterFinished: 86400  # Keep completed job for 24h
+  template:
+    metadata:
+      labels:
+        app: db-migration  # Required for Fargate profile selector
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migration
+        image: your-registry/db-migration:latest  # Replace with your image
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        env:
+        # ===================
+        # SQL Server (Source)
+        # ===================
+        - name: SQLSERVER_HOST
+          value: "your-sqlserver-host.example.com"
+        - name: SQLSERVER_PORT
+          value: "1433"
+        - name: SQLSERVER_DATABASE
+          value: "your_database"
+        - name: SQLSERVER_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-migration-secrets
+              key: sqlserver-user
+        - name: SQLSERVER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-migration-secrets
+              key: sqlserver-password
+        - name: SQLSERVER_TRUST_CERT
+          value: "true"
+
+        # ===================
+        # PostgreSQL (Target)
+        # ===================
+        - name: POSTGRES_HOST
+          value: "your-postgres-host.example.com"
+        - name: POSTGRES_PORT
+          value: "5432"
+        - name: POSTGRES_DATABASE
+          value: "your_database"
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-migration-secrets
+              key: postgres-user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-migration-secrets
+              key: postgres-password
+
+        # ===================
+        # Migration Config
+        # ===================
+        - name: MODE
+          value: "direct"  # "direct" = streaming, "export" = via S3/BCP
+        - name: PARALLEL_ANALYSIS
+          value: "8"       # Tables to analyze concurrently
+        - name: PARALLEL_MIGRATION
+          value: "4"       # Tables to migrate concurrently
+        - name: BATCH_SIZE
+          value: "5000"    # Rows per INSERT batch
+        - name: JSON_THRESHOLD
+          value: "73"      # Score threshold for JSON detection (0-100)
+        - name: BCP_USE_DOCKER
+          value: "false"   # Use BCP installed in container
+
+        # ===================
+        # Tables Filter (optional)
+        # ===================
+        # Uncomment to migrate specific tables only
+        # - name: TABLES
+        #   value: "dbo.Table1,dbo.Table2"
+
+        # ===================
+        # S3 Config (for export mode)
+        # ===================
+        # Uncomment if using MODE=export
+        # - name: S3_ENABLED
+        #   value: "true"
+        # - name: S3_BUCKET
+        #   value: "your-bucket"
+        # - name: S3_REGION
+        #   value: "us-east-1"
+        # - name: S3_PREFIX
+        #   value: "migrations/"
+        # - name: S3_ACCESS_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: db-migration-secrets
+        #       key: s3-access-key
+        # - name: S3_SECRET_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: db-migration-secrets
+        #       key: s3-secret-key
